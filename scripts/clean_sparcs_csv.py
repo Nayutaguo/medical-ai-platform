@@ -19,10 +19,7 @@ from medical_ai.data import (
 )
 
 DEFAULT_RAW_CSV = (
-    ROOT.parent
-    / "009 医养项目数据"
-    / "Hospital_Inpatient_Discharges__SPARCS_De-Identified___2021_20231012.csv"
-    / "Hospital_Inpatient_Discharges__SPARCS_De-Identified___2021_20231012.csv"
+    Path("C:\\Users\\唐嘉佑\\Desktop\\生产实习\\Hospital_Inpatient_Discharges__SPARCS_De-Identified___2021_20231012.csv\\Hospital_Inpatient_Discharges__SPARCS_De-Identified___2021_20231012.csv")
 )
 DEFAULT_OUTPUT = ROOT / "data" / "processed" / "inpatient_sparcs_2021_clean.csv"
 
