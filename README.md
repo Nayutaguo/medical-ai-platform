@@ -1,19 +1,21 @@
 # Smart Medical Big Data and AI Analysis Platform
 
-This repository is the phase-1 MVP skeleton for a hospital inpatient discharge data analysis platform.
+This repository contains the phase-1 product foundation for a hospital inpatient discharge data analysis platform.
 
-The current scope is intentionally narrow:
+The current product path is constrained to authenticated, facility-scoped
+aggregate analysis with a minimum-group privacy boundary:
 
 ```text
 QuerySpec JSON
   -> validation
   -> safe SQLAlchemy Core query compilation
   -> MySQL executor
-  -> structured JSON result
-  -> MCP tools
+  -> repository and service layers
+  -> versioned Flask JSON API
+  -> React/MUI/ECharts workbench
 ```
 
-The current working loop also includes an OpenAI-compatible LLM-first Agent that returns intent, safe `QuerySpec`, chart recommendation, execution steps, and a short result interpretation. A React/MUI/ECharts demo frontend renders the result table, chart, and Agent insight. Spark/Hadoop and Python code execution are reserved for later phases.
+The current working loop also includes an OpenAI-compatible LLM-first Agent that returns intent, safe `QuerySpec`, chart recommendation, execution steps, and a short result interpretation. The frontend is retained and incrementally productized rather than rewritten. Spark/Hadoop and Python code execution are reserved for later phases.
 
 ## Project Root
 
@@ -45,9 +47,11 @@ Edit `.env` locally. Never commit `.env`.
 
 ## MySQL
 
-Docker is optional. The current WSL environment uses local MySQL installed through Ubuntu packages.
+Docker is optional. The current macOS development machine uses a local MySQL
+instance; the same `MYSQL_*` contract works with Docker or a package-managed
+MySQL installation.
 
-Local MySQL route:
+Ubuntu/WSL local MySQL route, when applicable:
 
 ```bash
 sudo apt-get update
@@ -107,6 +111,55 @@ RUN_MYSQL_TESTS=1 conda run -n medical-ai pytest tests/integration
 conda run -n medical-ai python scripts/demo_query_mysql.py data/sample/queryspec_avg_charges_by_age.json
 ```
 
+## Control-plane database migration
+
+Identity, authorization, session, audit, and background-job tables are managed
+through Alembic. The migration reads the existing `MYSQL_*` environment values;
+credentials are never stored in `alembic.ini`.
+
+```bash
+conda run -n medical-ai alembic upgrade head
+conda run -n medical-ai alembic current
+```
+
+The existing `inpatient` analytics table is an external baseline and is never
+dropped by the control-plane migration. The reviewed rollback is available as
+`alembic downgrade 001_existing_analytics_baseline`; it destroys control-plane
+data and must not be run as a routine operation.
+
+The current browser-session endpoints and their error/cookie contract are
+documented in [`docs/API_AUTH.md`](docs/API_AUTH.md).
+
+Create the first organization administrator once, after migration. The password
+is prompted securely and there is no shipped default credential:
+
+```bash
+conda run -n medical-ai python scripts/bootstrap_admin.py \
+  --email admin@example.com \
+  --display-name "Platform Administrator" \
+  --organization-name "Hospital A" \
+  --organization-slug hospital-a
+```
+
+The bootstrap administrator receives governance permissions only. Analytical
+permissions and facility access must be assigned explicitly after data scopes
+are configured.
+
+Additional users register only from an administrator-issued, one-time
+invitation. Until the administration UI is delivered, a trusted operator can
+issue a 24-hour invitation from the local control-plane environment:
+
+```bash
+conda run -n medical-ai python scripts/create_user_invitation.py \
+  --organization-id <organization-uuid> \
+  --email analyst@example.com
+```
+
+The command prints the bearer invitation once. Transfer it through an approved
+secret channel; never place it in Git, tickets, logs, or environment examples.
+The invited user enters it on the frontend **注册** tab. Registration activates
+only the user and organization membership; it grants no role or facility scope.
+
 ## Tests
 
 ```bash
@@ -118,6 +171,10 @@ Optional MySQL integration tests:
 ```bash
 RUN_MYSQL_TESTS=1 pytest tests/integration
 ```
+
+Current verified baseline: 291 unit tests pass, the normal suite skips six
+external integrations, and all six MySQL integrations pass when explicitly
+enabled. The frontend also passes `tsc --noEmit` and `npm run build`.
 
 ## Minimal Demo
 
@@ -155,6 +212,10 @@ LLM_MODEL
 
 ## MCP Server
 
+MCP is a local-development transport only at present. Product environments set
+`MCP_ALLOW_UNSCOPED_TOOLS=false`; the server and every tool fail closed until an
+authenticated principal adapter can provide the same `AccessContext` as HTTP.
+
 Default stdio transport:
 
 ```bash
@@ -179,15 +240,73 @@ Validated Streamable HTTP client demo:
 conda run -n medical-ai python scripts/demo_mcp_http_client.py --url http://127.0.0.1:3001/mcp
 ```
 
-## Frontend Demo
+## Web Application
 
-The demo frontend uses React + Vite + MUI + ECharts, following the workbench pattern from the MIT-licensed Data Formulator project. It shows schema, distinct values, Agent intent, QuerySpec, execution metadata, result table, chart, and written insight.
+The web frontend uses React + Vite + MUI + ECharts, following the workbench pattern from the MIT-licensed Data Formulator project. It shows schema, distinct values, Agent intent, QuerySpec, execution metadata, result table, chart, and written insight.
 
 Start backend API:
 
 ```bash
 conda run -n medical-ai python scripts/run_demo_server.py --host 127.0.0.1 --port 8000
 ```
+
+Local loopback Gunicorn entry point:
+
+```bash
+conda run -n medical-ai gunicorn --config gunicorn.conf.py medical_ai.api.dev_wsgi:app
+```
+
+The development WSGI entry point is intentionally anonymous and must remain
+bound to loopback. To display and exercise the real login/session/RBAC path
+locally after bootstrapping the first administrator, use the authenticated
+development entry point instead:
+
+```bash
+conda run -n medical-ai gunicorn --config gunicorn.conf.py medical_ai.api.auth_dev_wsgi:app
+```
+
+This authenticated development entry point is also loopback-only. It uses
+plain-HTTP cookies for local testing, keeps unscoped MCP disabled, and does not
+create a default account or password. The production entry point is
+`medical_ai.api.wsgi:app`; it refuses to start unless authentication is
+enforced, secure cookies are enabled, Redis login protection is configured, and
+unscoped MCP tools are disabled.
+
+```bash
+APP_ENVIRONMENT=production \
+AUTH_ENFORCEMENT_ENABLED=true \
+AUTH_SESSION_COOKIE_SECURE=true \
+MCP_ALLOW_UNSCOPED_TOOLS=false \
+RATE_LIMIT_ENABLED=true \
+REDIS_URL=rediss://redis.internal:6379/0 \
+RATE_LIMIT_KEY_SECRET='<at-least-32-random-bytes>' \
+conda run -n medical-ai gunicorn --config gunicorn.conf.py medical_ai.api.wsgi:app
+```
+
+`gunicorn.conf.py` keeps the WSGI timeout above the bounded LLM retry window. Override its local defaults with
+`GUNICORN_*` environment variables when needed.
+
+For OpenAI-compatible providers, `LLM_BASE_URL` must be the API base path expected before `/chat/completions`
+(commonly a URL ending in `/v1`). The client validates JSON response envelopes, retries bounded transient failures,
+and returns stable 502/504 API errors instead of exposing provider responses.
+
+Versioned endpoints:
+
+- `GET /api/v1/health`
+- `GET /api/v1/health/live`
+- `GET /api/v1/health/ready`
+- `POST /api/v1/auth/sessions`
+- `GET /api/v1/auth/me`
+- `DELETE /api/v1/auth/sessions/current`
+- `GET /api/v1/schema`
+- `GET /api/v1/distinct`
+- `POST /api/v1/query`
+- `POST /api/v1/ask`
+
+Every response uses the stable `success/data/meta/error` envelope and returns an
+`X-Request-Id` header. Governed analytics require exact permissions, a non-empty
+trusted facility scope, approved field capabilities, and groups at or above the
+privacy threshold. See `docs/API_AUTH.md` and ADR 0003.
 
 Start frontend:
 

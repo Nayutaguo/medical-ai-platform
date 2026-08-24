@@ -24,13 +24,75 @@ Goal: run a safe, testable data-query chain.
 - Keep the raw LLM response available for debugging.
 - Add minimal demos that can run without a frontend.
 
-## Phase 2 - HTTP Backend and Minimal Frontend
+## Phase 2 - Product HTTP Backend and Existing Frontend
 
-- Add a small HTTP API wrapping the same query service.
-- Build a React + Vite + MUI + ECharts workbench demo based on Data Formulator's mature frontend direction.
-- Display query result tables and simple charts.
-- Add schema-aware UI controls for distinct-value inspection.
-- Later decide whether to continue React/MUI or revisit Vue + ECharts.
+- Completed: Flask application factory and `/api/v1` Blueprint.
+- Completed: repository/service/API dependency direction.
+- Completed: stable `success/data/meta/error` contract, request IDs, size limits, and exception mapping.
+- Completed: aggregate-only public QuerySpec endpoint and LLM-not-configured degradation.
+- Completed: existing React + Vite + MUI + ECharts workbench migrated through a minimal API-client change.
+- Add deployment configuration around the Gunicorn WSGI entry point.
+- Identity, authorization, audit, and privacy work is tracked as the dedicated Phase 2.5 product release gate.
+
+## Phase 2.5 - Identity, Governance, and Operational Control Plane
+
+Goal: turn the analytical workbench into an authenticated, tenant-aware, auditable product without rewriting the existing frontend or splitting premature microservices. The accepted direction is documented in [`docs/adr/0001-identity-governance-control-plane.md`](adr/0001-identity-governance-control-plane.md).
+
+### Identity and persistence foundation
+
+- Completed: Alembic baseline plus additive migrations through
+  `006_invitation_registration`, including facilities, cross-tenant integrity,
+  and tenant-bound one-time invitations.
+- Separate the logical control and analytics schemas and use least-privilege credentials for application control writes, analytics reads, audit appends, and ingestion.
+- Completed foundation: organizations, users, memberships, roles, permissions,
+  grants, facilities, scopes, sessions, tenant-bound invitation tokens, audit
+  ledger, background jobs, and dataset versions. Idempotency/outbox behavior
+  remains.
+- Completed: one-time administrator bootstrap with no default password.
+
+### Authentication and authorization
+
+- Completed: Argon2id, opaque server-side sessions, secure-cookie posture, CSRF,
+  frontend login/invited-registration/session/logout, and Redis source/account
+  authentication throttling. Password reset, broader account lifecycle policy,
+  and privileged MFA remain.
+- Completed: authenticated immutable `AccessContext` with user, organization,
+  membership, permissions, versions, and fail-closed facility scope.
+- Completed for analytics services: stable exact permission codes; frontend
+  visibility is not an authorization boundary.
+- Completed for authenticated HTTP: RBAC plus organization/facility data scopes
+  and a trusted predicate outside QuerySpec/model input.
+- Require explicit, time-bounded, and fully audited emergency access instead of granting medical-data access implicitly to platform administrators.
+
+### Privacy, audit, and transport parity
+
+- Completed: configurable minimum groups enforced with SQL `HAVING` before
+  `LIMIT`, defensive filtering, and indistinguishable empty/suppressed output.
+- Completed first field-policy slice: governed distinct/dimension/aggregation/
+  filter capabilities across all 34 inpatient fields.
+- Persist sanitized append-only audit events for authentication, administration, queries, Agent calls, imports, exports, and job lifecycle changes.
+- Completed storage primitive only: audit request-path and transaction/outbox
+  integration remains.
+- Completed: authenticated product analytics routes and non-sensitive health.
+- Completed fail-closed product posture: unscoped MCP is disabled. An
+  authenticated MCP principal adapter remains.
+
+### Product UI and operations
+
+- Completed first UI slice: existing workbench plus login, invitation-only
+  registration, permission-pending state, session restore, current organization,
+  and logout. Administration pages remain.
+- Completed first Redis slice: production login throttling. Query/Agent limits,
+  session/authorization caches, and invalidation remain.
+- Move long-running Agent, import, quality, export, and report work to durable background jobs; expose bounded status polling and cancellation APIs.
+- Use transactions, unique constraints, idempotency keys, and optimistic locking for business correctness; reserve distributed locks for singleton imports, schedulers, and duplicate job submission.
+
+### Release acceptance
+
+- Verify 401, 403, 409, and 429 response contracts and preserve the existing response envelope and request IDs.
+- Test cross-organization and cross-facility isolation, session fixation and expiry, brute-force protection, permission-cache invalidation, minimum-group suppression, and audit completeness.
+- Test Redis and worker outages, retry idempotency, cancellation, recovery, and full-data query plans before production exposure.
+- Once authentication is enabled in production, all failure and rollback paths must fail closed rather than restore anonymous analytical access.
 
 ## Phase 3 - Data Agent Workflow
 
@@ -42,6 +104,8 @@ Goal: run a safe, testable data-query chain.
   - execution steps
   - post-query LLM `AgentInsight`
 - Add planner validation and retry loops around schema/tool feedback.
+- Completed transport-resilience slice: bounded retries, empty/non-JSON response validation, 502/504 mapping, and post-query insight degradation.
+- Move long-running Agent requests from synchronous WSGI workers to background jobs with task status polling.
 - Keep human-readable execution trace.
 - Inspect DeepAnalyze and LAMBDA before implementing agent state, artifact tracking, and tool-calling workflow.
 
