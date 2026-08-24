@@ -65,6 +65,13 @@ def extract_json_object(text: str) -> dict[str, Any]:
 def normalize_llm_queryspec(data: dict[str, Any]) -> dict[str, Any]:
     normalized = deepcopy(data)
 
+    # LLMs sometimes emit JSON null for optional arrays. Treat it as omission so
+    # QuerySpec's safe empty-list defaults apply; validation still enforces every
+    # supplied item and the aggregate-only API rejects an empty metrics list.
+    for field in ("select", "filters", "group_by", "metrics", "order_by"):
+        if normalized.get(field) is None:
+            normalized.pop(field, None)
+
     filters = normalized.get("filters")
     if isinstance(filters, list):
         for item in filters:
@@ -83,9 +90,14 @@ def normalize_llm_queryspec(data: dict[str, Any]) -> dict[str, Any]:
     metrics = normalized.get("metrics")
     if isinstance(metrics, list):
         for item in metrics:
-            if isinstance(item, dict) and "agg" not in item and "function" in item:
-                item["agg"] = item["function"]
+            if isinstance(item, dict) and "agg" not in item:
+                if "function" in item:
+                    item["agg"] = item["function"]
+                elif "aggregation" in item:
+                    item["agg"] = item["aggregation"]
+            if isinstance(item, dict):
                 item.pop("function", None)
+                item.pop("aggregation", None)
             if isinstance(item, dict) and isinstance(item.get("agg"), str):
                 item["agg"] = item["agg"].lower()
             if isinstance(item, dict) and item.get("agg") == "count" and "field" not in item:

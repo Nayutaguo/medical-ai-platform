@@ -1,9 +1,51 @@
 export interface HealthPayload {
-  ok: boolean;
-  database: string;
-  row_count: number;
-  llm_configured: boolean;
-  elapsed_ms: number;
+  status: 'alive';
+}
+
+export interface AuthSession {
+  user: {
+    id: string;
+    email: string;
+    display_name: string;
+  };
+  organization: {
+    id: string;
+    name: string;
+    membership_id: string;
+  };
+  permissions: string[];
+  expires_at: string;
+  idle_expires_at: string;
+}
+
+export interface LoginCredentials {
+  email: string;
+  password: string;
+  organization_id?: string;
+}
+
+export interface LoginPayload {
+  session: AuthSession;
+  csrf_token: string;
+}
+
+export interface RegistrationCredentials {
+  invitation_token: string;
+  email: string;
+  display_name: string;
+  password: string;
+}
+
+export interface RegistrationPayload {
+  registered: true;
+}
+
+export interface CurrentSessionPayload {
+  session: AuthSession;
+}
+
+export interface LogoutPayload {
+  revoked: boolean;
 }
 
 export interface SchemaColumn {
@@ -70,6 +112,11 @@ export interface AskPayload {
   result?: QueryResult;
   tool_result?: Record<string, unknown>;
   insight?: AgentInsight | null;
+  warnings?: Array<{
+    code: string;
+    message: string;
+  }>;
+  disclaimer?: string;
 }
 
 export interface DistinctPayload {

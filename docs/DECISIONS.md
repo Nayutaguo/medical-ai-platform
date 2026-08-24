@@ -154,3 +154,48 @@ Third-party influence:
 - Data Formulator's `intentClassifier`, `chartRecommendation`, and `workflowContext` informed the separation of intent, chart recommendation, and execution trace.
 - LAMBDA's agent service informed the explicit tool/result/summary loop.
 - DeepAnalyze remains a future reference for stronger multi-step data-science planning, but its model/code-execution stack is too heavy for this step.
+
+## D015 - Productize the Existing Frontend and Introduce a Versioned Flask API
+
+Date: 2026-08-20
+
+Keep the existing React/MUI/ECharts workbench and make only incremental product changes. Do not rewrite the frontend in Vue during the current delivery phase.
+
+Replace the temporary standard-library HTTP server with a Flask application factory and versioned `/api/v1` Blueprint. The production dependency direction is:
+
+```text
+Flask API -> AnalyticsService -> MedicalDataRepository -> MySQLExecutor
+```
+
+Rationale: the existing frontend already implements the required analysis workspace, so a rewrite would delay product delivery without improving the safety boundary. The backend requires a stronger separation because request validation, stable contracts, observability, authorization, and privacy controls must have explicit ownership.
+
+Rules:
+
+- All HTTP endpoints use the `success/data/meta/error` envelope.
+- Every response carries `X-Request-Id` and metadata includes the same identifier.
+- Public QuerySpec execution is aggregate-only by default.
+- Flask routes contain no SQL compilation or database access.
+- Services and repositories do not depend on Flask request/response objects.
+- Raw LLM responses are not returned from the production API.
+- `medical_ai.api.wsgi:app` is the production WSGI entry point; the local runner is not a production server.
+
+Third-party influence: Data Formulator's Flask Blueprint and request-ID/error-handler separation was inspected as an MIT-licensed architecture reference. No source was copied.
+
+## D016 - Bound LLM Retries and Preserve Completed Query Results
+
+Date: 2026-08-23
+
+Keep the current synchronous OpenAI-compatible client for this productization slice, but validate the HTTP response envelope before parsing model content and apply bounded retries only to transient failures.
+
+Rules:
+
+- Empty bodies, non-JSON content types, malformed JSON, and malformed chat-completion envelopes are upstream response failures.
+- Retry network failures, HTTP 429, retryable 5xx responses, and malformed transient responses with bounded exponential backoff.
+- Do not retry stable 4xx responses such as 400, 401, or 403.
+- Planning failures return a stable 502 or 504 API error; stack traces and upstream response bodies are never returned to clients.
+- If the aggregate query has completed and only result interpretation fails, return the query result with an `INSIGHT_UNAVAILABLE` warning.
+- Gunicorn timeout remains above the bounded synchronous retry window. Background jobs replace this synchronous path before production scale-out.
+
+Rationale: upstream model proxies can return empty bodies, HTML pages, malformed envelopes, or delayed responses even when prompts are valid. Transport failures must not become generic 500 errors or discard validated database results.
+
+Third-party review: existing LAMBDA and MCP SDK timeout/retry patterns were inspected for separation of application deadlines and transport retries. No third-party source was copied.

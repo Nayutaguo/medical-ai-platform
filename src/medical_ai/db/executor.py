@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+import logging
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from decimal import Decimal
@@ -13,6 +14,8 @@ from sqlalchemy.exc import SQLAlchemyError
 from medical_ai.config import Settings, get_settings
 from medical_ai.db.schema import build_sqlalchemy_table, get_column_spec
 from medical_ai.query.compiler import ExecutableQuery, compile_statement
+
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass
@@ -62,7 +65,10 @@ class MySQLExecutor:
                     timeout_metadata["mysql_session_timeout_set"] = True
                 except SQLAlchemyError as exc:
                     timeout_metadata["mysql_session_timeout_set"] = False
-                    timeout_metadata["mysql_session_timeout_error"] = str(exc)
+                    LOGGER.warning(
+                        "mysql_session_timeout_unavailable error_type=%s",
+                        type(exc).__name__,
+                    )
 
             result = connection.execute(statement)
             rows = [_jsonable_row(dict(row)) for row in result.mappings().all()]

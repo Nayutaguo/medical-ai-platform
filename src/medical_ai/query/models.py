@@ -5,6 +5,8 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 DEFAULT_LIMIT = 100
 MAX_LIMIT = 1000
+PRIVACY_RESERVED_ALIAS_PREFIX = "__privacy_"
+PRIVACY_GROUP_COUNT_ALIAS = f"{PRIVACY_RESERVED_ALIAS_PREFIX}group_count"
 
 
 class FilterOperator(str, Enum):

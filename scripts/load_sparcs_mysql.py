@@ -24,6 +24,7 @@ from medical_ai.db.schema import build_sqlalchemy_table
 DEFAULT_CLEAN_CSV = ROOT / "data" / "processed" / "inpatient_sparcs_2021_clean.csv"
 # 这些索引用于加速常见的分组、筛选和聚合查询。
 COMMON_INDEXES = {
+    "idx_inpatient_facility_year": "(`PermanentFacilityId`(128), `DischargeYear`)",
     "idx_inpatient_year_age": "(`DischargeYear`, `AgeGroup`(32))",
     "idx_inpatient_age": "(`AgeGroup`(32))",
     "idx_inpatient_gender": "(`Gender`(32))",

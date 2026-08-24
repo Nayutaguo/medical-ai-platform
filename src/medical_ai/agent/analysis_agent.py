@@ -1,18 +1,40 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+import logging
+from collections.abc import Iterable
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field
 
 from medical_ai.agent.charting import ChartSpec, recommend_chart
 from medical_ai.agent.intent import AgentIntent, AgentRoute, IntentType
-from medical_ai.agent.llm_client import ChatMessage, OpenAICompatibleClient
+from medical_ai.agent.llm_client import ChatMessage, LLMClientError, OpenAICompatibleClient
 from medical_ai.agent.query_planner import extract_json_object, normalize_llm_queryspec
 from medical_ai.db import MySQLExecutor, QueryResult, public_schema
-from medical_ai.query import ExecutableQuery, QuerySpec, QueryValidationError, compile_query, validate_query_spec
+from medical_ai.query import (
+    ExecutableQuery,
+    QuerySpec,
+    QueryValidationError,
+    build_privacy_safe_metadata,
+    compile_query,
+    compile_scoped_query,
+    filter_minimum_group_rows,
+    require_governed_distinct_field,
+    require_governed_query,
+    validate_query_spec,
+)
+
+LOGGER = logging.getLogger(__name__)
+
+
+class _TrustedFacilityScopeUnset:
+    """Sentinel distinguishing an omitted scope from an explicit empty scope."""
+
+
+_TRUSTED_FACILITY_SCOPE_UNSET = _TrustedFacilityScopeUnset()
 
 
 class ToolName(str, Enum):
@@ -44,6 +66,13 @@ class AgentInsight(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class AgentWarning(BaseModel):
+    code: str
+    message: str
+
+    model_config = ConfigDict(extra="forbid")
+
+
 @dataclass(frozen=True)
 class AgentRun:
     question: str
@@ -54,8 +83,11 @@ class AgentRun:
     insight: AgentInsight | None = None
     raw_plan_response: str = ""
     raw_insight_response: str = ""
+    warnings: list[AgentWarning] = field(default_factory=list)
+    redact_compiled_query: bool = False
 
     def to_dict(self) -> dict[str, Any]:
+        expose_compiled_query = self.compiled_query and not self.redact_compiled_query
         return {
             "question": self.question,
             "intent": self.plan.intent.model_dump(mode="json"),
@@ -66,20 +98,39 @@ class AgentRun:
             "execution_steps": self.plan.execution_steps,
             "query_spec": self.plan.query_spec.model_dump(mode="json") if self.plan.query_spec else None,
             "chart_spec": self.plan.chart_spec.model_dump(mode="json") if self.plan.chart_spec else None,
-            "compiled_sql": self.compiled_query.sql if self.compiled_query else None,
-            "compiled_params": self.compiled_query.params if self.compiled_query else {},
+            "compiled_sql": self.compiled_query.sql if expose_compiled_query else None,
+            "compiled_params": self.compiled_query.params if expose_compiled_query else {},
             "result": self.result.to_dict() if self.result else None,
             "tool_result": self.tool_result,
             "insight": self.insight.model_dump(mode="json") if self.insight else None,
+            "warnings": [warning.model_dump(mode="json") for warning in self.warnings],
             "raw_plan_response": self.raw_plan_response,
             "raw_insight_response": self.raw_insight_response,
         }
 
 
 class MedicalDataAgent:
-    def __init__(self, client: OpenAICompatibleClient | None = None, executor: MySQLExecutor | None = None) -> None:
+    def __init__(
+        self,
+        client: OpenAICompatibleClient | None = None,
+        executor: MySQLExecutor | None = None,
+        require_aggregate: bool = False,
+        trusted_facility_ids: (
+            Iterable[str] | None | _TrustedFacilityScopeUnset
+        ) = _TRUSTED_FACILITY_SCOPE_UNSET,
+        privacy_min_group_size: int = 5,
+    ) -> None:
         self.client = client or OpenAICompatibleClient()
         self.executor = executor or MySQLExecutor()
+        self.require_aggregate = require_aggregate
+        self.trusted_facility_ids = (
+            None
+            if isinstance(trusted_facility_ids, _TrustedFacilityScopeUnset)
+            else _normalize_trusted_facility_scope(trusted_facility_ids)
+        )
+        self.privacy_min_group_size = _validate_privacy_min_group_size(
+            privacy_min_group_size
+        )
 
     def plan(self, question: str) -> tuple[AgentPlan, str]:
         response = self.client.chat_json(
@@ -89,16 +140,20 @@ class MedicalDataAgent:
             ],
             max_tokens=2200,
         )
-        data = normalize_agent_plan(extract_json_object(response))
         try:
+            data = normalize_agent_plan(extract_json_object(response))
             plan = AgentPlan.model_validate(data)
-        except ValidationError as exc:
-            raise QueryValidationError(f"LLM produced invalid AgentPlan: {exc}. Raw response: {response}") from exc
+        except (TypeError, ValueError) as exc:
+            raise QueryValidationError(f"LLM produced invalid AgentPlan: {exc}") from exc
 
         if plan.tool_name is ToolName.QUERY_MEDICAL_DATA:
             if plan.query_spec is None:
                 raise QueryValidationError(f"LLM selected query_medical_data without query_spec. Raw response: {response}")
             validated_spec = validate_query_spec(plan.query_spec)
+            if self.require_aggregate and not validated_spec.metrics:
+                raise QueryValidationError("公开分析接口仅允许返回聚合结果，query_spec.metrics 不能为空")
+            if self.trusted_facility_ids is not None:
+                require_governed_query(validated_spec)
             plan = plan.model_copy(update={"query_spec": validated_spec})
 
         return plan, response
@@ -123,7 +178,7 @@ class MedicalDataAgent:
                 raw_plan_response=raw_plan,
             )
 
-        compiled_query = compile_query(plan.query_spec)
+        compiled_query = self._compile_query(plan.query_spec)
         if not execute:
             chart_spec = plan.chart_spec or recommend_chart(plan.query_spec, None, plan.intent)
             return AgentRun(
@@ -131,16 +186,32 @@ class MedicalDataAgent:
                 plan=plan.model_copy(update={"chart_spec": chart_spec}),
                 compiled_query=compiled_query,
                 raw_plan_response=raw_plan,
+                redact_compiled_query=self.trusted_facility_ids is not None,
             )
 
         result = self.executor.execute(compiled_query)
+        if self.trusted_facility_ids is not None:
+            result = self._apply_minimum_group_privacy(
+                result,
+                safe_limit=compiled_query.limit,
+            )
         chart_spec = _validated_or_recommended_chart(plan, result)
         plan = plan.model_copy(update={"chart_spec": chart_spec})
 
         insight: AgentInsight | None = None
         raw_insight = ""
+        warnings: list[AgentWarning] = []
         if interpret:
-            insight, raw_insight = self.interpret(question, plan, result)
+            try:
+                insight, raw_insight = self.interpret(question, plan, result)
+            except (LLMClientError, QueryValidationError) as exc:
+                LOGGER.warning("agent_insight_unavailable error_type=%s", type(exc).__name__)
+                warnings.append(
+                    AgentWarning(
+                        code="INSIGHT_UNAVAILABLE",
+                        message="查询已完成，但 AI 文字解读暂时不可用，请稍后重试。",
+                    )
+                )
 
         return AgentRun(
             question=question,
@@ -150,6 +221,8 @@ class MedicalDataAgent:
             insight=insight,
             raw_plan_response=raw_plan,
             raw_insight_response=raw_insight,
+            warnings=warnings,
+            redact_compiled_query=self.trusted_facility_ids is not None,
         )
 
     def interpret(self, question: str, plan: AgentPlan, result: QueryResult) -> tuple[AgentInsight, str]:
@@ -176,11 +249,11 @@ class MedicalDataAgent:
             ],
             max_tokens=1200,
         )
-        data = extract_json_object(response)
         try:
+            data = extract_json_object(response)
             return AgentInsight.model_validate(data), response
-        except ValidationError as exc:
-            raise QueryValidationError(f"LLM produced invalid result insight: {exc}. Raw response: {response}") from exc
+        except (TypeError, ValueError) as exc:
+            raise QueryValidationError(f"LLM produced invalid result insight: {exc}") from exc
 
     def _run_distinct_tool(self, tool_args: dict[str, Any]) -> dict[str, Any]:
         table = str(tool_args.get("table") or "inpatient")
@@ -188,7 +261,31 @@ class MedicalDataAgent:
         if not field:
             raise QueryValidationError("get_distinct_values requires tool_args.field")
         limit = int(tool_args.get("limit") or 30)
-        result = self.executor.fetch_distinct_values(table, field, limit)
+        if self.trusted_facility_ids is None:
+            result = self.executor.fetch_distinct_values(table, field, limit)
+        else:
+            require_governed_distinct_field(table, field)
+            effective_limit = min(
+                max(limit, 1),
+                self._max_distinct_values(),
+                1000,
+            )
+            compiled_query = compile_scoped_query(
+                {
+                    "table": table,
+                    "select": [field],
+                    "filters": [{"field": field, "op": "is_not_null"}],
+                    "group_by": [field],
+                    "order_by": [{"field": field, "direction": "asc"}],
+                    "limit": effective_limit,
+                },
+                trusted_facility_ids=self.trusted_facility_ids,
+                privacy_min_group_size=self.privacy_min_group_size,
+            )
+            result = self._apply_minimum_group_privacy(
+                self.executor.execute(compiled_query),
+                safe_limit=compiled_query.limit,
+            )
         return {
             "table": table,
             "field": field,
@@ -196,7 +293,84 @@ class MedicalDataAgent:
             "row_count": result.row_count,
             "truncated": result.truncated,
             "query_time_ms": result.query_time_ms,
+            **({"metadata": result.metadata} if self.trusted_facility_ids is not None else {}),
         }
+
+    def _compile_query(self, query_spec: QuerySpec | None) -> ExecutableQuery:
+        """Compile a planned query with an out-of-band scope when configured."""
+
+        if query_spec is None:
+            raise QueryValidationError("query_medical_data requires query_spec")
+        if self.trusted_facility_ids is None:
+            return compile_query(query_spec)
+        return compile_scoped_query(
+            query_spec,
+            trusted_facility_ids=self.trusted_facility_ids,
+            privacy_min_group_size=self.privacy_min_group_size,
+        )
+
+    def _apply_minimum_group_privacy(
+        self,
+        result: QueryResult,
+        *,
+        safe_limit: int,
+    ) -> QueryResult:
+        """Sanitize scoped results before charting or LLM interpretation."""
+
+        filtered = filter_minimum_group_rows(
+            result.rows,
+            result.columns,
+            self.privacy_min_group_size,
+        )
+        return QueryResult(
+            columns=filtered.columns,
+            rows=filtered.rows,
+            row_count=len(filtered.rows),
+            query_time_ms=result.query_time_ms,
+            truncated=len(filtered.rows) >= safe_limit,
+            metadata=build_privacy_safe_metadata(
+                result.metadata,
+                self.privacy_min_group_size,
+            ),
+        )
+
+    def _max_distinct_values(self) -> int:
+        """Read the executor's configured distinct cap without exposing it."""
+
+        settings = getattr(self.executor, "settings", None)
+        configured_limit = getattr(settings, "query_max_distinct_values", 200)
+        try:
+            return max(int(configured_limit), 1)
+        except (TypeError, ValueError):
+            return 200
+
+
+def _normalize_trusted_facility_scope(
+    facility_ids: Iterable[str] | None,
+) -> tuple[str, ...]:
+    """Normalize a server-supplied facility scope and reject empty input."""
+
+    if facility_ids is None or isinstance(facility_ids, (str, bytes, bytearray)):
+        raise QueryValidationError("trusted facility scope must not be empty")
+
+    normalized: set[str] = set()
+    for facility_id in facility_ids:
+        if not isinstance(facility_id, str) or not facility_id.strip():
+            raise QueryValidationError(
+                "trusted facility scope contains an invalid facility identifier"
+            )
+        normalized.add(facility_id.strip())
+    if not normalized:
+        raise QueryValidationError("trusted facility scope must not be empty")
+    return tuple(sorted(normalized))
+
+
+def _validate_privacy_min_group_size(value: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or not 2 <= value <= 100:
+        raise QueryValidationError(
+            "privacy_min_group_size must be an integer between 2 and 100"
+        )
+    return value
 
 
 def normalize_agent_plan(data: dict[str, Any]) -> dict[str, Any]:
@@ -255,10 +429,20 @@ def _normalize_chart_spec(chart: dict[str, Any]) -> dict[str, Any]:
     normalized = dict(chart)
     if "type" in normalized and "chart_type" not in normalized:
         normalized["chart_type"] = normalized.pop("type")
-    if "x" in normalized and "x_field" not in normalized:
-        normalized["x_field"] = normalized.pop("x")
-    if "y" in normalized and "y_field" not in normalized:
-        normalized["y_field"] = normalized.pop("y")
+    if "x_field" not in normalized:
+        if "x" in normalized:
+            normalized["x_field"] = normalized["x"]
+        elif "dimension" in normalized:
+            normalized["x_field"] = normalized["dimension"]
+    normalized.pop("x", None)
+    normalized.pop("dimension", None)
+    if "y_field" not in normalized:
+        if "y" in normalized:
+            normalized["y_field"] = normalized["y"]
+        elif "metric" in normalized:
+            normalized["y_field"] = normalized["metric"]
+    normalized.pop("y", None)
+    normalized.pop("metric", None)
     if "series" in normalized and "series_field" not in normalized:
         normalized["series_field"] = normalized.pop("series")
     normalized.setdefault("title", "Query result")
@@ -322,7 +506,11 @@ def _planning_system_prompt() -> str:
         "EmergencyDepartmentIndicator values are Yes or No. "
         "Supported filter operators are =, !=, >, >=, <, <=, in, not_in, between, like, is_null, is_not_null. "
         "Supported aggregations are count, sum, avg, min, max. "
+        "Metric objects must use field, agg, and alias; never use function or aggregation. "
+        "Optional collection fields must be JSON arrays when present, never null. "
         "Supported chart_spec.chart_type values are table, bar, grouped_bar, line, pie, number. "
+        "Chart objects must use chart_type, x_field, y_field, series_field, title, and reason; "
+        "never use dimension or metric as chart keys. "
         "Use line charts for trends over DischargeYear, pie only for simple count/share distributions, grouped_bar for two grouped dimensions, and bar for ranked or comparison aggregates. "
         "Return this exact JSON shape: "
         "{"

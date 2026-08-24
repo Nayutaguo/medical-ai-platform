@@ -106,3 +106,22 @@ def test_normalize_llm_queryspec_adds_star_for_count_metric_without_field() -> N
     )
 
     assert normalized["metrics"][0]["field"] == "*"
+
+
+def test_normalize_llm_queryspec_accepts_aggregation_alias_and_null_optional_lists() -> None:
+    normalized = normalize_llm_queryspec(
+        {
+            "table": "inpatient",
+            "select": None,
+            "filters": None,
+            "group_by": ["AgeGroup"],
+            "metrics": [{"field": "*", "aggregation": "COUNT", "alias": "patient_count"}],
+            "order_by": None,
+        }
+    )
+
+    assert "select" not in normalized
+    assert "filters" not in normalized
+    assert normalized["metrics"][0]["agg"] == "count"
+    assert "aggregation" not in normalized["metrics"][0]
+    assert "order_by" not in normalized

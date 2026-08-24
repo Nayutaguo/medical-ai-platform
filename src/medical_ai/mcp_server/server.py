@@ -31,6 +31,10 @@ def query_medical_data(query_spec: dict[str, Any]) -> dict[str, Any]:
 
 def main() -> None:
     settings = get_settings()
+    if not settings.mcp_allow_unscoped_tools:
+        raise RuntimeError(
+            "MCP tools are disabled until an authenticated AccessContext adapter is configured"
+        )
     if settings.mcp_transport == "stdio":
         mcp.run()
         return
