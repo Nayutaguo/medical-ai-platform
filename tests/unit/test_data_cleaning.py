@@ -50,6 +50,22 @@ def test_clean_sparcs_row_normalizes_real_values() -> None:
     assert cleaned["RaceEthnicity"] == "White | Not Span/Hispanic"
 
 
+def test_clean_sparcs_row_treats_unknown_integer_as_null() -> None:
+    row = {
+        "Length of Stay": "UNKN",
+        "Discharge Year": "2021",
+        "APR DRG Code": "UNKN",
+        "APR MDC Code": "5",
+        "APR Severity of Illness Code": "3",
+        "Birth Weight": "",
+    }
+
+    cleaned = clean_sparcs_row(row)
+
+    assert cleaned["LengthOfStay"] is None
+    assert cleaned["APRDRGCode"] is None
+
+
 def test_data_quality_profile_tracks_counts_ranges_and_lengths() -> None:
     cleaned = {
         "HospitalServiceArea": "New York City",
