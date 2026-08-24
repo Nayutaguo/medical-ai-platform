@@ -21,6 +21,7 @@ from medical_ai.db.schema import build_sqlalchemy_table
 
 DEFAULT_CLEAN_CSV = ROOT / "data" / "processed" / "inpatient_sparcs_2021_clean.csv"
 COMMON_INDEXES = {
+    "idx_inpatient_facility_year": "(`PermanentFacilityId`(128), `DischargeYear`)",
     "idx_inpatient_year_age": "(`DischargeYear`, `AgeGroup`(32))",
     "idx_inpatient_age": "(`AgeGroup`(32))",
     "idx_inpatient_gender": "(`Gender`(32))",
