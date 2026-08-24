@@ -1,11 +1,18 @@
 import re
 from collections.abc import Mapping, Sequence
+from decimal import Decimal
+from math import isfinite
 from typing import Any
 
 from pydantic import ValidationError
 
 from medical_ai.db.schema import get_column_spec, get_table_spec
-from medical_ai.query.models import Aggregation, FilterOperator, QuerySpec
+from medical_ai.query.models import (
+    Aggregation,
+    FilterOperator,
+    PRIVACY_RESERVED_ALIAS_PREFIX,
+    QuerySpec,
+)
 
 ALIAS_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
 LIST_OPERATORS = {FilterOperator.IN, FilterOperator.NOT_IN}
@@ -21,6 +28,8 @@ SCALAR_OPERATORS = {
     FilterOperator.LIKE,
 }
 NUMERIC_AGGREGATIONS = {Aggregation.SUM, Aggregation.AVG}
+MAX_FILTER_STRING_BYTES = 512
+MAX_LIKE_PATTERN_BYTES = 160
 
 
 class QueryValidationError(ValueError):
@@ -50,6 +59,10 @@ class QueryValidator:
         for metric in spec.metrics:
             if not ALIAS_PATTERN.fullmatch(metric.alias):
                 raise QueryValidationError(f"Invalid metric alias {metric.alias!r}")
+            if metric.alias.lower().startswith(PRIVACY_RESERVED_ALIAS_PREFIX):
+                raise QueryValidationError(
+                    f"Metric alias prefix {PRIVACY_RESERVED_ALIAS_PREFIX!r} is reserved"
+                )
             if metric.alias in aliases:
                 raise QueryValidationError(f"Duplicate metric alias {metric.alias!r}")
             if metric.alias in table.columns:
@@ -63,7 +76,12 @@ class QueryValidator:
                 raise QueryValidationError(
                     f"Operator {filter_spec.op.value!r} is not allowed for field {filter_spec.field!r}"
                 )
-            self._validate_filter_value(filter_spec.op, filter_spec.value, filter_spec.field)
+            self._validate_filter_value(
+                filter_spec.op,
+                filter_spec.value,
+                filter_spec.field,
+                data_type=column.data_type,
+            )
 
         orderable_fields = set(aliases)
         if spec.metrics:
@@ -95,7 +113,14 @@ class QueryValidator:
         if agg in NUMERIC_AGGREGATIONS and not column.numeric:
             raise QueryValidationError(f"Aggregation {agg.value!r} requires a numeric field")
 
-    def _validate_filter_value(self, op: FilterOperator, value: Any, field: str) -> None:
+    def _validate_filter_value(
+        self,
+        op: FilterOperator,
+        value: Any,
+        field: str,
+        *,
+        data_type: str,
+    ) -> None:
         if op in UNARY_OPERATORS:
             if value is not None:
                 raise QueryValidationError(f"Operator {op.value!r} for field {field!r} must not provide a value")
@@ -108,21 +133,71 @@ class QueryValidator:
                 raise QueryValidationError(f"Operator {op.value!r} for field {field!r} requires a non-empty list")
             if len(value) > 1000:
                 raise QueryValidationError(f"Operator {op.value!r} for field {field!r} allows at most 1000 values")
+            for item in value:
+                self._validate_scalar_value(item, field, data_type=data_type)
             return
 
         if op in RANGE_OPERATORS:
             if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)) or len(value) != 2:
                 raise QueryValidationError(f"Operator {op.value!r} for field {field!r} requires exactly two values")
+            for item in value:
+                self._validate_scalar_value(item, field, data_type=data_type)
+            if value[0] > value[1]:
+                raise QueryValidationError(
+                    f"Operator {op.value!r} for field {field!r} requires an ascending range"
+                )
             return
 
         if op is FilterOperator.LIKE:
             if not isinstance(value, str):
                 raise QueryValidationError(f"Operator {op.value!r} for field {field!r} requires a string value")
+            encoded_length = len(value.encode("utf-8"))
+            if encoded_length == 0 or encoded_length > MAX_LIKE_PATTERN_BYTES:
+                raise QueryValidationError(
+                    f"Operator {op.value!r} for field {field!r} has an invalid pattern length"
+                )
+            if not value.replace("%", "").replace("_", ""):
+                raise QueryValidationError(
+                    f"Operator {op.value!r} for field {field!r} requires a selective pattern"
+                )
             return
 
         if op in SCALAR_OPERATORS:
             if value is None or isinstance(value, (Mapping, Sequence)) and not isinstance(value, (str, bytes, bytearray)):
                 raise QueryValidationError(f"Operator {op.value!r} for field {field!r} requires a scalar value")
+            self._validate_scalar_value(value, field, data_type=data_type)
+
+    def _validate_scalar_value(
+        self,
+        value: Any,
+        field: str,
+        *,
+        data_type: str,
+    ) -> None:
+        """Reject nested, oversized, non-finite, and type-confused bind values."""
+
+        if value is None or isinstance(value, (bool, Mapping, Sequence)) and not isinstance(value, str):
+            raise QueryValidationError(f"Filter value for field {field!r} has an invalid scalar type")
+
+        if data_type == "integer":
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise QueryValidationError(f"Filter value for field {field!r} must be an integer")
+            return
+
+        if data_type == "decimal":
+            if not isinstance(value, (int, float, Decimal)) or isinstance(value, bool):
+                raise QueryValidationError(f"Filter value for field {field!r} must be numeric")
+            if isinstance(value, float) and not isfinite(value):
+                raise QueryValidationError(f"Filter value for field {field!r} must be finite")
+            if isinstance(value, Decimal) and not value.is_finite():
+                raise QueryValidationError(f"Filter value for field {field!r} must be finite")
+            return
+
+        if not isinstance(value, str):
+            raise QueryValidationError(f"Filter value for field {field!r} must be a string")
+        encoded_length = len(value.encode("utf-8"))
+        if encoded_length == 0 or encoded_length > MAX_FILTER_STRING_BYTES:
+            raise QueryValidationError(f"Filter value for field {field!r} exceeds its length limit")
 
     def _ensure_unique(self, values: list[str], label: str) -> None:
         duplicates = sorted({value for value in values if values.count(value) > 1})

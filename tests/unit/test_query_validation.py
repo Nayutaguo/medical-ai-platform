@@ -85,3 +85,64 @@ def test_in_filter_requires_non_empty_list() -> None:
 
     with pytest.raises(QueryValidationError):
         validate_query_spec(query)
+
+
+@pytest.mark.parametrize(
+    "alias",
+    ["__privacy_group_count", "__PRIVACY_override", "__privacy_custom"],
+)
+def test_reserved_privacy_metric_alias_prefix_cannot_be_smuggled(alias: str) -> None:
+    query = base_query()
+    query["metrics"] = [{"field": "*", "agg": "count", "alias": alias}]
+
+    with pytest.raises(QueryValidationError, match="reserved"):
+        validate_query_spec(query)
+
+
+def test_privacy_threshold_cannot_be_supplied_through_query_spec() -> None:
+    query = base_query()
+    query["privacy_min_group_size"] = 1
+
+    with pytest.raises(QueryValidationError, match="privacy_min_group_size"):
+        validate_query_spec(query)
+
+
+@pytest.mark.parametrize(
+    ("field", "operator", "value"),
+    [
+        ("AgeGroup", "in", [["nested"]]),
+        ("AgeGroup", "in", [None]),
+        ("DischargeYear", "=", "2021"),
+        ("TotalCharges", "=", float("inf")),
+        ("AgeGroup", "=", "x" * 513),
+    ],
+)
+def test_filter_values_reject_nested_type_confused_or_unbounded_inputs(
+    field: str,
+    operator: str,
+    value: object,
+) -> None:
+    query = base_query()
+    query["filters"] = [{"field": field, "op": operator, "value": value}]
+
+    with pytest.raises(QueryValidationError):
+        validate_query_spec(query)
+
+
+def test_between_requires_an_ascending_typed_range() -> None:
+    query = base_query()
+    query["filters"] = [
+        {"field": "DischargeYear", "op": "between", "value": [2022, 2021]}
+    ]
+
+    with pytest.raises(QueryValidationError, match="ascending range"):
+        validate_query_spec(query)
+
+
+@pytest.mark.parametrize("pattern", ["%", "_", "%" + "x" * 160])
+def test_like_pattern_is_bounded_and_must_be_selective(pattern: str) -> None:
+    query = base_query()
+    query["filters"] = [{"field": "AgeGroup", "op": "like", "value": pattern}]
+
+    with pytest.raises(QueryValidationError):
+        validate_query_spec(query)
