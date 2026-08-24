@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import type { ReactElement, ReactNode } from 'react';
+import type { FormEvent, ReactElement, ReactNode } from 'react';
 import * as echarts from 'echarts';
 import {
   Alert,
@@ -22,6 +22,8 @@ import {
   TableContainer,
   TableHead,
   TableRow,
+  Tab,
+  Tabs,
   TextField,
   ThemeProvider,
   Toolbar,
@@ -35,19 +37,36 @@ import SchemaIcon from '@mui/icons-material/Schema';
 import SmartToyIcon from '@mui/icons-material/SmartToy';
 import QueryStatsIcon from '@mui/icons-material/QueryStats';
 import TableRowsIcon from '@mui/icons-material/TableRows';
-import { ask, getDistinct, getHealth, getSchema, runQuerySpec } from './api';
+import {
+  ApiError,
+  ask,
+  getCurrentSession,
+  getDistinct,
+  getHealth,
+  getSchema,
+  isAuthenticationDisabled,
+  login,
+  logout,
+  registerAccount,
+  runQuerySpec,
+} from './api';
 import { theme } from './theme';
 import type {
   AgentInsight,
   AgentIntent,
   AskPayload,
+  AuthSession,
   ChartSpec,
   DistinctPayload,
   HealthPayload,
   QueryResult,
+  RegistrationCredentials,
   SchemaColumn,
   SchemaPayload,
 } from './types';
+
+type AuthStatus = 'checking' | 'authenticated' | 'anonymous' | 'unauthenticated' | 'error';
+type AuthFieldError = { field: string; message: string };
 
 const defaultQuestion = '2021年50到69岁和70岁以上患者的平均总费用是多少，按年龄组排序';
 const sampleSpec = {
@@ -73,6 +92,12 @@ const sampleQuestions = [
 ];
 
 export function App() {
+  const [authStatus, setAuthStatus] = useState<AuthStatus>('checking');
+  const [session, setSession] = useState<AuthSession | null>(null);
+  const [authError, setAuthError] = useState<string | null>(null);
+  const [authFieldErrors, setAuthFieldErrors] = useState<AuthFieldError[]>([]);
+  const [authNotice, setAuthNotice] = useState<string | null>(null);
+  const [authLoading, setAuthLoading] = useState(false);
   const [health, setHealth] = useState<HealthPayload | null>(null);
   const [schema, setSchema] = useState<SchemaPayload | null>(null);
   const [distinct, setDistinct] = useState<DistinctPayload | null>(null);
@@ -82,6 +107,17 @@ export function App() {
   const [queryResult, setQueryResult] = useState<QueryResult | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  const canAccessWorkbench =
+    authStatus === 'anonymous' ||
+    (authStatus === 'authenticated' && session?.permissions.includes('analytics.schema.read') === true);
+
+  const reportRequestFailure = useCallback((err: unknown) => {
+    if (err instanceof ApiError && err.status === 401) {
+      setSession(null);
+      setAuthStatus('unauthenticated');
+    }
+    setError(err instanceof Error ? err.message : String(err));
+  }, []);
 
   const loadBasics = useCallback(async () => {
     setError(null);
@@ -90,17 +126,116 @@ export function App() {
       setHealth(nextHealth);
       setSchema(nextSchema);
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      reportRequestFailure(err);
+    }
+  }, [reportRequestFailure]);
+
+  const restoreAuthentication = useCallback(async () => {
+    setAuthError(null);
+    setAuthFieldErrors([]);
+    setAuthNotice(null);
+    setAuthStatus('checking');
+    try {
+      const activeSession = await getCurrentSession();
+      setSession(activeSession);
+      setAuthStatus('authenticated');
+    } catch (err) {
+      setSession(null);
+      if (isAuthenticationDisabled(err)) {
+        setAuthStatus('anonymous');
+        return;
+      }
+      if (err instanceof ApiError && err.status === 401) {
+        setAuthStatus('unauthenticated');
+        return;
+      }
+      setAuthError(err instanceof Error ? err.message : String(err));
+      setAuthFieldErrors(err instanceof ApiError ? err.fieldErrors : []);
+      setAuthStatus('error');
     }
   }, []);
 
   useEffect(() => {
-    void loadBasics();
-  }, [loadBasics]);
+    void restoreAuthentication();
+  }, [restoreAuthentication]);
+
+  useEffect(() => {
+    if (canAccessWorkbench) {
+      void loadBasics();
+    }
+  }, [canAccessWorkbench, loadBasics]);
+
+  const handleLogin = async (email: string, password: string, organizationId: string) => {
+    setAuthLoading(true);
+    setAuthError(null);
+    setAuthFieldErrors([]);
+    setAuthNotice(null);
+    setError(null);
+    try {
+      const activeSession = await login({
+        email,
+        password,
+        ...(organizationId.trim() ? { organization_id: organizationId.trim() } : {}),
+      });
+      setSession(activeSession);
+      setAuthStatus('authenticated');
+    } catch (err) {
+      setAuthError(err instanceof Error ? err.message : String(err));
+      setAuthFieldErrors(err instanceof ApiError ? err.fieldErrors : []);
+    } finally {
+      setAuthLoading(false);
+    }
+  };
+
+  const handleRegistration = async (credentials: RegistrationCredentials): Promise<boolean> => {
+    setAuthLoading(true);
+    setAuthError(null);
+    setAuthFieldErrors([]);
+    setAuthNotice(null);
+    setError(null);
+    try {
+      await registerAccount(credentials);
+      setAuthNotice('注册成功，请使用新账号登录。数据权限需要由组织管理员另行分配。');
+      return true;
+    } catch (err) {
+      setAuthError(err instanceof Error ? err.message : String(err));
+      setAuthFieldErrors(err instanceof ApiError ? err.fieldErrors : []);
+      return false;
+    } finally {
+      setAuthLoading(false);
+    }
+  };
+
+  const clearAuthFeedback = () => {
+    setAuthError(null);
+    setAuthFieldErrors([]);
+    setAuthNotice(null);
+  };
+
+  const handleLogout = async () => {
+    setAuthLoading(true);
+    setError(null);
+    try {
+      await logout();
+      setSession(null);
+      setHealth(null);
+      setSchema(null);
+      setDistinct(null);
+      setAskResult(null);
+      setQueryResult(null);
+      setAuthStatus('unauthenticated');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setAuthLoading(false);
+    }
+  };
 
   const handleAsk = async () => {
     setLoading(true);
     setError(null);
+    setAskResult(null);
+    setQueryResult(null);
     try {
       const payload = await ask(question);
       setAskResult(payload);
@@ -109,7 +244,7 @@ export function App() {
       }
       setQueryResult(payload.result ?? null);
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      reportRequestFailure(err);
     } finally {
       setLoading(false);
     }
@@ -118,13 +253,15 @@ export function App() {
   const handleRunSpec = async () => {
     setLoading(true);
     setError(null);
+    setAskResult(null);
+    setQueryResult(null);
     try {
       const parsed = JSON.parse(querySpecText) as Record<string, unknown>;
       const payload = await runQuerySpec(parsed);
       setAskResult(null);
       setQueryResult(payload);
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      reportRequestFailure(err);
     } finally {
       setLoading(false);
     }
@@ -135,7 +272,7 @@ export function App() {
     try {
       setDistinct(await getDistinct(field));
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      reportRequestFailure(err);
     }
   };
 
@@ -150,140 +287,437 @@ export function App() {
             <Box>
               <Typography variant="h1">Medical AI Workbench</Typography>
               <Typography variant="body2" color="text.secondary">
-                SPARCS inpatient discharge analysis demo
+                受治理的住院出院数据分析
               </Typography>
             </Box>
-            <Stack direction="row" spacing={1} useFlexGap flexWrap="wrap" justifyContent="flex-end">
-              <StatusChip icon={<StorageIcon />} label={health ? `MySQL ${health.database}` : 'MySQL'} ok={Boolean(health?.ok)} />
-              <Chip size="small" label={health ? `${health.row_count.toLocaleString()} rows` : 'Rows --'} />
-              <StatusChip icon={<SmartToyIcon />} label={health?.llm_configured ? 'LLM configured' : 'LLM missing'} ok={Boolean(health?.llm_configured)} />
-              <Tooltip title="Refresh">
-                <IconButton size="small" onClick={() => void loadBasics()}>
-                  <RefreshIcon fontSize="small" />
-                </IconButton>
-              </Tooltip>
-            </Stack>
+            {authStatus === 'authenticated' || authStatus === 'anonymous' ? (
+              <Stack direction="row" spacing={1} useFlexGap flexWrap="wrap" justifyContent="flex-end" alignItems="center">
+                {canAccessWorkbench ? (
+                  <>
+                    <StatusChip icon={<StorageIcon />} label={health?.status === 'alive' ? '服务在线' : '服务检查中'} ok={health?.status === 'alive'} />
+                    <Chip size="small" label={schema ? `${columns.length} fields` : 'Schema --'} />
+                  </>
+                ) : null}
+                {session ? (
+                  <>
+                    <Chip
+                      size="small"
+                      variant="outlined"
+                      label={`${session.user.display_name || session.user.email} · ${session.organization.name}`}
+                    />
+                    <Button size="small" color="inherit" onClick={() => void handleLogout()} disabled={authLoading}>
+                      退出
+                    </Button>
+                  </>
+                ) : (
+                  <Chip size="small" variant="outlined" label="匿名开发模式" />
+                )}
+                <Tooltip title="Refresh">
+                  <IconButton size="small" onClick={() => void loadBasics()}>
+                    <RefreshIcon fontSize="small" />
+                  </IconButton>
+                </Tooltip>
+              </Stack>
+            ) : null}
           </Toolbar>
         </AppBar>
 
-        <Box
-          component="main"
-          sx={{
-            flex: 1,
-            minHeight: 0,
-            p: 1.5,
-            display: 'grid',
-            gridTemplateColumns: { xs: '1fr', lg: '310px minmax(480px, 1fr) 430px' },
-            gap: 1.5,
-          }}
-        >
-          <SchemaPanel columns={columns} distinct={distinct} onDistinct={handleDistinct} />
+        {authStatus === 'checking' ? (
+          <AuthStatePanel>
+            <CircularProgress size={28} />
+            <Typography color="text.secondary">正在恢复会话…</Typography>
+          </AuthStatePanel>
+        ) : authStatus === 'error' ? (
+          <AuthStatePanel>
+            <Alert severity="error" sx={{ width: '100%' }}>
+              {authError ?? '无法验证当前会话'}
+            </Alert>
+            <Button variant="outlined" onClick={() => void restoreAuthentication()}>
+              重试
+            </Button>
+          </AuthStatePanel>
+        ) : authStatus === 'unauthenticated' ? (
+          <AuthenticationPanel
+            loading={authLoading}
+            error={authError}
+            fieldErrors={authFieldErrors}
+            notice={authNotice}
+            onLogin={handleLogin}
+            onRegister={handleRegistration}
+            onModeChange={clearAuthFeedback}
+          />
+        ) : authStatus === 'authenticated' && !canAccessWorkbench ? (
+          <AccessPendingPanel session={session} />
+        ) : (
+          <Box
+            component="main"
+            sx={{
+              flex: 1,
+              minHeight: 0,
+              p: 1.5,
+              display: 'grid',
+              gridTemplateColumns: { xs: '1fr', lg: '310px minmax(480px, 1fr) 430px' },
+              gap: 1.5,
+            }}
+          >
+            <SchemaPanel columns={columns} distinct={distinct} onDistinct={handleDistinct} />
 
-          <Stack spacing={1.5} minWidth={0} minHeight={0}>
-            <Paper sx={{ p: 1.5 }}>
-              <SectionTitle icon={<SmartToyIcon />} title="Ask" secondary="Natural language -> QuerySpec -> MySQL" />
-              <TextField
-                value={question}
-                onChange={(event) => setQuestion(event.target.value)}
-                multiline
-                minRows={4}
-                fullWidth
-                sx={{ mt: 1.5 }}
-              />
-              <Stack direction="row" flexWrap="wrap" gap={0.75} sx={{ mt: 1.25 }}>
-                {sampleQuestions.map((sample) => (
-                  <Chip key={sample} size="small" label={sample} onClick={() => setQuestion(sample)} />
-                ))}
-              </Stack>
-              <Stack direction="row" spacing={1} sx={{ mt: 1.5 }}>
-                <Button startIcon={loading ? <CircularProgress size={16} color="inherit" /> : <PlayArrowIcon />} variant="contained" onClick={handleAsk} disabled={loading}>
-                  Run Agent
-                </Button>
-                <Button variant="outlined" onClick={() => setQuerySpecText(JSON.stringify(sampleSpec, null, 2))}>
-                  Load Sample QuerySpec
-                </Button>
-              </Stack>
-            </Paper>
+            <Stack spacing={1.5} minWidth={0} minHeight={0}>
+              <Paper sx={{ p: 1.5 }}>
+                <SectionTitle icon={<SmartToyIcon />} title="Ask" secondary="Natural language -> QuerySpec -> MySQL" />
+                <TextField
+                  value={question}
+                  onChange={(event) => setQuestion(event.target.value)}
+                  multiline
+                  minRows={4}
+                  fullWidth
+                  sx={{ mt: 1.5 }}
+                />
+                <Stack direction="row" flexWrap="wrap" gap={0.75} sx={{ mt: 1.25 }}>
+                  {sampleQuestions.map((sample) => (
+                    <Chip key={sample} size="small" label={sample} onClick={() => setQuestion(sample)} />
+                  ))}
+                </Stack>
+                <Stack direction="row" spacing={1} sx={{ mt: 1.5 }}>
+                  <Button startIcon={loading ? <CircularProgress size={16} color="inherit" /> : <PlayArrowIcon />} variant="contained" onClick={handleAsk} disabled={loading}>
+                    Run Agent
+                  </Button>
+                  <Button variant="outlined" onClick={() => setQuerySpecText(JSON.stringify(sampleSpec, null, 2))}>
+                    Load Sample QuerySpec
+                  </Button>
+                </Stack>
+              </Paper>
 
-            {error ? <Alert severity="error">{error}</Alert> : null}
+              {error ? <Alert severity="error">{error}</Alert> : null}
+              {askResult?.warnings?.map((warning) => (
+                <Alert key={warning.code} severity="warning">
+                  {warning.message}
+                </Alert>
+              ))}
+              {askResult?.disclaimer ? (
+                <Alert severity="info" icon={false}>
+                  {askResult.disclaimer}
+                </Alert>
+              ) : null}
 
-            <Paper sx={{ minHeight: 0, display: 'grid', gridTemplateRows: 'auto auto 280px minmax(240px, 1fr)' }}>
+              <Paper sx={{ minHeight: 0, display: 'grid', gridTemplateRows: 'auto auto 280px minmax(240px, 1fr)' }}>
+                <Box sx={{ p: 1.5, pb: 0 }}>
+                  <SectionTitle
+                    icon={<QueryStatsIcon />}
+                    title="Result"
+                    secondary={
+                      askResult?.intent
+                        ? `${askResult.intent.intent_type} · ${(askResult.intent.confidence * 100).toFixed(0)}%`
+                        : queryResult
+                          ? `${queryResult.row_count} rows in ${queryResult.query_time_ms} ms`
+                          : 'Waiting for query'
+                    }
+                  />
+                </Box>
+                <InsightPanel insight={askResult?.insight ?? null} intent={askResult?.intent ?? null} />
+                <ResultChart result={queryResult} chartSpec={askResult?.chart_spec ?? null} />
+                <ResultTable result={queryResult} />
+              </Paper>
+            </Stack>
+
+            <Paper sx={{ minWidth: 0, minHeight: { xs: 520, lg: 0 }, display: 'flex', flexDirection: 'column' }}>
               <Box sx={{ p: 1.5, pb: 0 }}>
                 <SectionTitle
-                  icon={<QueryStatsIcon />}
-                  title="Result"
-                  secondary={
-                    askResult?.intent
-                      ? `${askResult.intent.intent_type} · ${(askResult.intent.confidence * 100).toFixed(0)}%`
-                      : queryResult
-                        ? `${queryResult.row_count} rows in ${queryResult.query_time_ms} ms`
-                        : 'Waiting for query'
+                  icon={<SchemaIcon />}
+                  title="QuerySpec"
+                  secondary="Strict JSON, not SQL"
+                  action={
+                    <Tooltip title="Run QuerySpec">
+                      <IconButton size="small" onClick={handleRunSpec} disabled={loading}>
+                        <PlayArrowIcon fontSize="small" />
+                      </IconButton>
+                    </Tooltip>
                   }
                 />
               </Box>
-              <InsightPanel insight={askResult?.insight ?? null} intent={askResult?.intent ?? null} />
-              <ResultChart result={queryResult} chartSpec={askResult?.chart_spec ?? null} />
-              <ResultTable result={queryResult} />
-            </Paper>
-          </Stack>
-
-          <Paper sx={{ minWidth: 0, minHeight: { xs: 520, lg: 0 }, display: 'flex', flexDirection: 'column' }}>
-            <Box sx={{ p: 1.5, pb: 0 }}>
-              <SectionTitle
-                icon={<SchemaIcon />}
-                title="QuerySpec"
-                secondary="Strict JSON, not SQL"
-                action={
-                  <Tooltip title="Run QuerySpec">
-                    <IconButton size="small" onClick={handleRunSpec} disabled={loading}>
-                      <PlayArrowIcon fontSize="small" />
-                    </IconButton>
-                  </Tooltip>
-                }
-              />
-            </Box>
-            <TextField
-              value={querySpecText}
-              onChange={(event) => setQuerySpecText(event.target.value)}
-              multiline
-              spellCheck={false}
-              sx={{
-                flex: '1 1 48%',
-                m: 1.5,
-                '& textarea': {
-                  fontFamily: '"Roboto Mono", Consolas, monospace',
-                  fontSize: 12,
-                  lineHeight: 1.5,
-                },
-              }}
-              minRows={12}
-            />
-            <Divider />
-            <Box sx={{ p: 1.5 }}>
-              <SectionTitle icon={<TableRowsIcon />} title="Execution" secondary="Compiled SQL and params" />
-              <Box
-                component="pre"
+              <TextField
+                value={querySpecText}
+                onChange={(event) => setQuerySpecText(event.target.value)}
+                multiline
+                spellCheck={false}
                 sx={{
-                  mt: 1,
-                  mb: 0,
-                  maxHeight: 260,
-                  overflow: 'auto',
-                  p: 1.25,
-                  borderRadius: 1,
-                  bgcolor: '#101828',
-                  color: '#f8fafc',
-                  fontSize: 12,
-                  lineHeight: 1.45,
-                  whiteSpace: 'pre-wrap',
+                  flex: '1 1 48%',
+                  m: 1.5,
+                  '& textarea': {
+                    fontFamily: '"Roboto Mono", Consolas, monospace',
+                    fontSize: 12,
+                    lineHeight: 1.5,
+                  },
                 }}
-              >
-                {executionText(askResult, queryResult)}
+                minRows={12}
+              />
+              <Divider />
+              <Box sx={{ p: 1.5 }}>
+                <SectionTitle icon={<TableRowsIcon />} title="Execution" secondary="受控执行信息" />
+                <Box
+                  component="pre"
+                  sx={{
+                    mt: 1,
+                    mb: 0,
+                    maxHeight: 260,
+                    overflow: 'auto',
+                    p: 1.25,
+                    borderRadius: 1,
+                    bgcolor: '#101828',
+                    color: '#f8fafc',
+                    fontSize: 12,
+                    lineHeight: 1.45,
+                    whiteSpace: 'pre-wrap',
+                  }}
+                >
+                  {executionText(askResult, queryResult)}
+                </Box>
               </Box>
-            </Box>
-          </Paper>
-        </Box>
+            </Paper>
+          </Box>
+        )}
       </Box>
     </ThemeProvider>
+  );
+}
+
+function AuthStatePanel({ children }: { children: ReactNode }) {
+  return (
+    <Box component="main" sx={{ flex: 1, display: 'grid', placeItems: 'center', p: 2 }}>
+      <Stack spacing={2} alignItems="center" sx={{ width: '100%', maxWidth: 460 }}>
+        {children}
+      </Stack>
+    </Box>
+  );
+}
+
+function AccessPendingPanel({ session }: { session: AuthSession | null }) {
+  return (
+    <AuthStatePanel>
+      <Paper sx={{ width: '100%', p: 3 }}>
+        <Stack spacing={2}>
+          <Box>
+            <Chip label="账号已激活" color="success" size="small" sx={{ mb: 1.5 }} />
+            <Typography variant="h2">分析权限待开通</Typography>
+            <Typography variant="body2" color="text.secondary" sx={{ mt: 0.75 }}>
+              {session?.user.display_name || session?.user.email || '当前账号'}已加入
+              {session?.organization.name ? `“${session.organization.name}”` : '当前组织'}。
+            </Typography>
+          </Box>
+          <Alert severity="info">
+            账号已激活，等待管理员分配分析权限和机构数据范围。
+          </Alert>
+          <Box>
+            <Typography variant="body2" fontWeight={700}>
+              管理员需要完成：
+            </Typography>
+            <Box component="ul" sx={{ mt: 1, mb: 0, pl: 2.5, color: 'text.secondary' }}>
+              <li>
+                <Typography variant="body2">分配具备 Schema 与分析能力的角色</Typography>
+              </li>
+              <li>
+                <Typography variant="body2">配置允许访问的机构数据范围</Typography>
+              </li>
+            </Box>
+          </Box>
+          <Divider />
+          <Typography variant="caption" color="text.secondary">
+            为保护医疗数据，权限开通前不会加载字段结构或发起分析请求。完成授权后，请退出并重新登录以刷新会话权限。
+          </Typography>
+        </Stack>
+      </Paper>
+    </AuthStatePanel>
+  );
+}
+
+function AuthenticationPanel({
+  loading,
+  error,
+  fieldErrors,
+  notice,
+  onLogin,
+  onRegister,
+  onModeChange,
+}: {
+  loading: boolean;
+  error: string | null;
+  fieldErrors: AuthFieldError[];
+  notice: string | null;
+  onLogin: (email: string, password: string, organizationId: string) => Promise<void>;
+  onRegister: (credentials: RegistrationCredentials) => Promise<boolean>;
+  onModeChange: () => void;
+}) {
+  const [mode, setMode] = useState<'login' | 'register'>('login');
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [organizationId, setOrganizationId] = useState('');
+  const [invitationToken, setInvitationToken] = useState('');
+  const [displayName, setDisplayName] = useState('');
+  const [passwordConfirmation, setPasswordConfirmation] = useState('');
+  const [clientError, setClientError] = useState<string | null>(null);
+
+  const changeMode = (_event: React.SyntheticEvent, nextMode: 'login' | 'register') => {
+    setMode(nextMode);
+    setPassword('');
+    setPasswordConfirmation('');
+    setInvitationToken('');
+    setClientError(null);
+    onModeChange();
+  };
+
+  const handleSubmit = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    setClientError(null);
+    if (mode === 'login') {
+      if (!email.trim() || !password) return;
+      await onLogin(email.trim(), password, organizationId);
+      return;
+    }
+
+    if (!invitationToken.trim() || !email.trim() || !displayName.trim() || !password) return;
+    if (password.length < 12) {
+      setClientError('密码至少需要 12 个字符。');
+      return;
+    }
+    if (password !== passwordConfirmation) {
+      setClientError('两次输入的密码不一致。');
+      return;
+    }
+    const registered = await onRegister({
+      invitation_token: invitationToken,
+      email,
+      display_name: displayName,
+      password,
+    });
+    if (registered) {
+      setMode('login');
+      setInvitationToken('');
+      setDisplayName('');
+      setPassword('');
+      setPasswordConfirmation('');
+      setOrganizationId('');
+    }
+  };
+
+  const registerFormComplete = Boolean(
+    invitationToken.trim() &&
+      email.trim() &&
+      displayName.trim() &&
+      password.length >= 12 &&
+      passwordConfirmation,
+  );
+
+  return (
+    <AuthStatePanel>
+      <Paper component="form" onSubmit={handleSubmit} sx={{ width: '100%', p: 3 }}>
+        <Stack spacing={2}>
+          <Box>
+            <Typography variant="h2">访问工作台</Typography>
+            <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
+              使用组织账号登录，或通过管理员发放的一次性邀请码注册。
+            </Typography>
+          </Box>
+          <Tabs value={mode} onChange={changeMode} variant="fullWidth" aria-label="登录或注册">
+            <Tab value="login" label="登录" disabled={loading} />
+            <Tab value="register" label="注册" disabled={loading} />
+          </Tabs>
+          {notice ? <Alert severity="success">{notice}</Alert> : null}
+          {error ? <Alert severity="error">{error}</Alert> : null}
+          {fieldErrors.length ? (
+            <Alert severity="error">
+              {fieldErrors.map((fieldError) => (
+                <Typography key={`${fieldError.field}:${fieldError.message}`} variant="body2">
+                  {fieldError.field}: {fieldError.message}
+                </Typography>
+              ))}
+            </Alert>
+          ) : null}
+          {clientError ? <Alert severity="warning">{clientError}</Alert> : null}
+          {mode === 'register' ? (
+            <TextField
+              label="邀请码"
+              value={invitationToken}
+              onChange={(event) => setInvitationToken(event.target.value)}
+              autoComplete="off"
+              required
+              autoFocus
+              fullWidth
+              helperText="邀请码由组织管理员发放，且只能使用一次。"
+            />
+          ) : null}
+          <TextField
+            label="邮箱"
+            type="email"
+            value={email}
+            onChange={(event) => setEmail(event.target.value)}
+            autoComplete="username"
+            required
+            autoFocus={mode === 'login'}
+            fullWidth
+          />
+          {mode === 'register' ? (
+            <TextField
+              label="显示名称"
+              value={displayName}
+              onChange={(event) => setDisplayName(event.target.value)}
+              autoComplete="name"
+              required
+              fullWidth
+            />
+          ) : null}
+          <TextField
+            label="密码"
+            type="password"
+            value={password}
+            onChange={(event) => setPassword(event.target.value)}
+            autoComplete={mode === 'login' ? 'current-password' : 'new-password'}
+            inputProps={mode === 'register' ? { minLength: 12 } : undefined}
+            required
+            fullWidth
+            helperText={mode === 'register' ? '至少 12 个字符；最终规则以服务端校验为准。' : undefined}
+          />
+          {mode === 'register' ? (
+            <>
+              <TextField
+                label="确认密码"
+                type="password"
+                value={passwordConfirmation}
+                onChange={(event) => setPasswordConfirmation(event.target.value)}
+                autoComplete="new-password"
+                inputProps={{ minLength: 12 }}
+                required
+                fullWidth
+                error={Boolean(passwordConfirmation && password !== passwordConfirmation)}
+                helperText={
+                  passwordConfirmation && password !== passwordConfirmation ? '两次输入的密码不一致。' : undefined
+                }
+              />
+              <Alert severity="info" icon={false}>
+                注册仅创建组织成员账号，不会自动授予医疗数据查询或管理权限。
+              </Alert>
+            </>
+          ) : (
+            <TextField
+              label="组织 ID（可选）"
+              value={organizationId}
+              onChange={(event) => setOrganizationId(event.target.value)}
+              autoComplete="off"
+              fullWidth
+            />
+          )}
+          <Button
+            type="submit"
+            variant="contained"
+            disabled={
+              loading ||
+              (mode === 'login' ? !email.trim() || !password : !registerFormComplete)
+            }
+          >
+            {loading ? <CircularProgress size={20} color="inherit" /> : mode === 'login' ? '登录' : '注册账号'}
+          </Button>
+        </Stack>
+      </Paper>
+    </AuthStatePanel>
   );
 }
 
@@ -391,17 +825,26 @@ function ResultChart({ result, chartSpec }: { result: QueryResult | null; chartS
     if (!ref.current) return;
     const instance = echarts.init(ref.current);
     const fields = resolveChartFields(result, chartSpec);
-    if (!result || !fields.xField || !fields.yField || rows.length === 0 || fields.chartType === 'table') {
+    const { xField, yField } = fields;
+    if (!result || !xField || !yField || rows.length === 0 || fields.chartType === 'table') {
       instance.setOption({
         title: { text: 'No chartable result yet', left: 'center', top: 'middle', textStyle: { color: '#667085', fontSize: 13, fontWeight: 400 } },
       });
     } else {
-      instance.setOption(buildChartOption(rows, fields, chartSpec), true);
+      instance.setOption(buildChartOption(rows, { ...fields, xField, yField }, chartSpec), true);
     }
-    const resize = () => instance.resize();
+    let resizeFrame: number | null = null;
+    const resize = () => {
+      if (resizeFrame !== null) return;
+      resizeFrame = window.requestAnimationFrame(() => {
+        resizeFrame = null;
+        instance.resize();
+      });
+    };
     window.addEventListener('resize', resize);
     return () => {
       window.removeEventListener('resize', resize);
+      if (resizeFrame !== null) window.cancelAnimationFrame(resizeFrame);
       instance.dispose();
     };
   }, [chartColumns, chartSpec, result, rows]);
