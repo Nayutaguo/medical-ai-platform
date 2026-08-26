@@ -13,7 +13,7 @@ from sqlalchemy import and_, create_engine, delete, func, or_, select, text, upd
 from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.exc import IntegrityError, OperationalError
 
-from medical_ai.audit import sanitize_audit_details
+from medical_ai.audit import AuditValidationError, sanitize_audit_details
 from medical_ai.authorization import AccessContext, PermissionCode
 from medical_ai.authorization.errors import PermissionDeniedError
 from medical_ai.config import Settings, get_settings
@@ -35,10 +35,13 @@ from medical_ai.identity import (
 )
 from medical_ai.identity.errors import (
     AdministrationLastManagerError,
+    AdministrationRoleInUseError,
+    AdministrationRoleKeyConflictError,
     AdministrationResourceNotFoundError,
     AdministrationScopeConflictError,
     AdministrationSelfLockoutError,
     AdministrationStatusConflictError,
+    AdministrationSystemRoleImmutableError,
     AdministrationVersionConflictError,
     BootstrapAlreadyCompletedError,
     FacilityCatalogInvalidError,
@@ -46,6 +49,7 @@ from medical_ai.identity.errors import (
     FacilityOwnershipConflictError,
     AuthenticationRequiredError,
     InvalidInvitationError,
+    InvalidPasswordResetError,
     InvitationCreationError,
 )
 from medical_ai.identity.models import (
@@ -53,9 +57,12 @@ from medical_ai.identity.models import (
     INVITATION_ACTIVATE_MEMBERSHIP,
     INVITED_MEMBER_DISPLAY_NAME,
     ActiveSession,
+    AdministrationAuditEvent,
+    AdministrationAuditPage,
     AdministrationFacility,
     AdministrationMember,
     AdministrationPage,
+    AdministrationPermission,
     AdministrationRole,
     BootstrapPlan,
     BootstrapResult,
@@ -64,6 +71,11 @@ from medical_ai.identity.models import (
     FacilityCatalogSyncResult,
     MembershipGrant,
     NewSession,
+    PASSWORD_RESET_PURPOSE,
+    PasswordChangePlan,
+    PasswordResetChallenge,
+    PasswordResetPlan,
+    PasswordResetTokenPlan,
     PersistedUserInvitation,
     RegistrationResult,
     USER_INVITATION_PURPOSE,
@@ -107,6 +119,22 @@ class IdentityRepository:
             users.c.email_normalized == normalized_email,
             users.c.deleted_at.is_(None),
         )
+        with self.engine.connect() as connection:
+            row = connection.execute(statement).mappings().one_or_none()
+        return _user_from_row(row) if row else None
+
+    def find_user_by_id(self, user_id: str) -> UserCredential | None:
+        """Load one active credential candidate by its non-secret identifier."""
+
+        statement = select(
+            users.c.id,
+            users.c.email,
+            users.c.display_name,
+            users.c.status,
+            users.c.password_hash,
+            users.c.password_algorithm,
+            users.c.auth_version,
+        ).where(users.c.id == user_id, users.c.deleted_at.is_(None))
         with self.engine.connect() as connection:
             row = connection.execute(statement).mappings().one_or_none()
         return _user_from_row(row) if row else None
@@ -786,6 +814,247 @@ class IdentityRepository:
         with self.engine.begin() as connection:
             connection.execute(statement)
 
+    def change_password(self, plan: PasswordChangePlan) -> None:
+        """Replace a verifier, revoke all sessions, and audit atomically."""
+
+        with self.engine.begin() as connection:
+            _lock_administration_organization(connection, plan.context.organization_id)
+            _revalidate_access_context(
+                connection,
+                plan.context,
+                occurred_at=plan.changed_at,
+                required_any=(),
+            )
+            credential = connection.execute(
+                select(
+                    users.c.password_hash,
+                    users.c.password_algorithm,
+                    users.c.auth_version,
+                )
+                .where(
+                    users.c.id == plan.context.user_id,
+                    users.c.status == "active",
+                    users.c.deleted_at.is_(None),
+                )
+                .with_for_update()
+            ).mappings().one_or_none()
+            if (
+                credential is None
+                or credential["password_algorithm"] != "argon2id"
+                or not isinstance(credential["password_hash"], str)
+                or not compare_digest(
+                    str(credential["password_hash"]),
+                    plan.expected_password_hash,
+                )
+                or int(credential["auth_version"]) != plan.context.identity_version
+            ):
+                raise AuthenticationRequiredError
+
+            result = connection.execute(
+                update(users)
+                .where(
+                    users.c.id == plan.context.user_id,
+                    users.c.auth_version == plan.context.identity_version,
+                )
+                .values(
+                    password_hash=plan.password_hash,
+                    password_algorithm=plan.password_algorithm,
+                    auth_version=users.c.auth_version + 1,
+                    updated_at=plan.changed_at,
+                    version=users.c.version + 1,
+                )
+            )
+            if result.rowcount != 1:
+                raise AuthenticationRequiredError
+            connection.execute(
+                update(auth_sessions)
+                .where(
+                    auth_sessions.c.user_id == plan.context.user_id,
+                    auth_sessions.c.revoked_at.is_(None),
+                )
+                .values(
+                    revoked_at=plan.changed_at,
+                    updated_at=plan.changed_at,
+                    version=auth_sessions.c.version + 1,
+                )
+            )
+            _append_identity_audit(
+                connection,
+                occurred_at=plan.changed_at,
+                request_id=plan.request_id,
+                organization_id=plan.context.organization_id,
+                actor_kind="user",
+                actor_membership_id=plan.context.membership_id,
+                actor_user_id=plan.context.user_id,
+                action="identity.password.change",
+                resource_type="user",
+                resource_id=plan.context.user_id,
+            )
+
+    def create_password_reset_token(self, plan: PasswordResetTokenPlan) -> bool:
+        """Persist one reset digest after revalidating its identity context."""
+
+        with self.engine.begin() as connection:
+            _lock_administration_organization(connection, plan.organization_id)
+            context = connection.execute(
+                select(
+                    users.c.auth_version,
+                    users.c.status.label("user_status"),
+                    users.c.password_hash,
+                    users.c.password_algorithm,
+                    users.c.deleted_at,
+                    organization_memberships.c.status.label("membership_status"),
+                )
+                .select_from(
+                    organization_memberships.join(
+                        users,
+                        users.c.id == organization_memberships.c.user_id,
+                    )
+                )
+                .where(
+                    organization_memberships.c.id == plan.membership_id,
+                    organization_memberships.c.organization_id == plan.organization_id,
+                    organization_memberships.c.user_id == plan.user_id,
+                )
+                .with_for_update()
+            ).mappings().one_or_none()
+            if (
+                context is None
+                or context["user_status"] != "active"
+                or context["membership_status"] != "active"
+                or context["deleted_at"] is not None
+                or context["password_algorithm"] != "argon2id"
+                or not isinstance(context["password_hash"], str)
+                or int(context["auth_version"]) != plan.identity_version
+            ):
+                # The public adapter still returns the same accepted envelope.
+                return False
+
+            connection.execute(
+                update(one_time_tokens)
+                .where(
+                    one_time_tokens.c.user_id == plan.user_id,
+                    one_time_tokens.c.purpose == PASSWORD_RESET_PURPOSE,
+                    one_time_tokens.c.consumed_at.is_(None),
+                )
+                .values(
+                    consumed_at=plan.created_at,
+                    version=one_time_tokens.c.version + 1,
+                )
+            )
+            connection.execute(
+                one_time_tokens.insert().values(
+                    id=plan.token_id,
+                    organization_id=plan.organization_id,
+                    membership_id=plan.membership_id,
+                    user_id=plan.user_id,
+                    purpose=PASSWORD_RESET_PURPOSE,
+                    token_hash=plan.token_hash,
+                    identity_version=plan.identity_version,
+                    expires_at=plan.expires_at,
+                    created_at=plan.created_at,
+                )
+            )
+            _append_identity_audit(
+                connection,
+                occurred_at=plan.created_at,
+                request_id=plan.request_id,
+                organization_id=plan.organization_id,
+                actor_kind="system",
+                actor_membership_id=None,
+                actor_user_id=None,
+                action="identity.password.reset.request",
+                resource_type="user",
+                resource_id=plan.user_id,
+            )
+            return True
+
+    def find_password_reset_challenge(
+        self,
+        *,
+        token_hash: bytes,
+        now: datetime,
+    ) -> PasswordResetChallenge | None:
+        """Resolve bounded optimistic facts for one currently usable token."""
+
+        with self.engine.connect() as connection:
+            row = connection.execute(
+                _password_reset_statement(token_hash)
+            ).mappings().one_or_none()
+        return _password_reset_challenge(row, now=now)
+
+    def consume_password_reset(self, plan: PasswordResetPlan) -> None:
+        """Consume a reset token, rotate the verifier, and revoke sessions."""
+
+        with self.engine.begin() as connection:
+            if not _lock_active_organization(
+                connection,
+                plan.expected_organization_id,
+            ):
+                raise InvalidPasswordResetError
+            row = connection.execute(
+                _password_reset_statement(plan.token_hash, for_update=True)
+            ).mappings().one_or_none()
+            challenge = _password_reset_challenge(row, now=plan.completed_at)
+            if challenge is None or not _password_reset_plan_matches(challenge, plan):
+                raise InvalidPasswordResetError
+            consumed = connection.execute(
+                update(one_time_tokens)
+                .where(
+                    one_time_tokens.c.token_hash == plan.token_hash,
+                    one_time_tokens.c.purpose == PASSWORD_RESET_PURPOSE,
+                    one_time_tokens.c.version == plan.expected_token_version,
+                    one_time_tokens.c.consumed_at.is_(None),
+                )
+                .values(
+                    consumed_at=plan.completed_at,
+                    version=one_time_tokens.c.version + 1,
+                )
+            )
+            changed = connection.execute(
+                update(users)
+                .where(
+                    users.c.id == plan.expected_user_id,
+                    users.c.auth_version == plan.expected_identity_version,
+                    users.c.version == plan.expected_user_version,
+                    users.c.status == "active",
+                    users.c.deleted_at.is_(None),
+                )
+                .values(
+                    password_hash=plan.password_hash,
+                    password_algorithm=plan.password_algorithm,
+                    auth_version=users.c.auth_version + 1,
+                    updated_at=plan.completed_at,
+                    version=users.c.version + 1,
+                )
+            )
+            if consumed.rowcount != 1 or changed.rowcount != 1:
+                raise InvalidPasswordResetError
+            connection.execute(
+                update(auth_sessions)
+                .where(
+                    auth_sessions.c.user_id == plan.expected_user_id,
+                    auth_sessions.c.revoked_at.is_(None),
+                )
+                .values(
+                    revoked_at=plan.completed_at,
+                    updated_at=plan.completed_at,
+                    version=auth_sessions.c.version + 1,
+                )
+            )
+            _append_identity_audit(
+                connection,
+                occurred_at=plan.completed_at,
+                request_id=plan.request_id,
+                organization_id=plan.expected_organization_id,
+                actor_kind="system",
+                actor_membership_id=None,
+                actor_user_id=None,
+                action="identity.password.reset.complete",
+                resource_type="user",
+                resource_id=plan.expected_user_id,
+            )
+
     def list_administration_members(
         self,
         organization_id: str,
@@ -862,6 +1131,7 @@ class IdentityRepository:
                 roles.c.role_key,
                 roles.c.name,
                 roles.c.description,
+                roles.c.is_system,
                 roles.c.version,
             )
             .where(roles.c.organization_id == organization_id)
@@ -922,6 +1192,351 @@ class IdentityRepository:
         page_rows = rows[:limit]
         items = tuple(_administration_facility(row) for row in page_rows)
         return AdministrationPage(
+            items=items,
+            next_cursor=str(page_rows[-1]["id"]) if has_more and page_rows else None,
+        )
+
+    def list_administration_permissions(
+        self,
+        *,
+        cursor: str | None,
+        limit: int,
+    ) -> AdministrationPage:
+        """Return the bounded application-known permission catalog."""
+
+        known_keys = tuple(permission.value for permission in PermissionCode)
+        statement = (
+            select(
+                permissions.c.id,
+                permissions.c.permission_key,
+                permissions.c.resource,
+                permissions.c.action,
+                permissions.c.description,
+                permissions.c.version,
+            )
+            .where(permissions.c.permission_key.in_(known_keys))
+            .order_by(permissions.c.id)
+            .limit(limit + 1)
+        )
+        if cursor is not None:
+            statement = statement.where(permissions.c.id > cursor)
+        with self.engine.connect() as connection:
+            rows = connection.execute(statement).mappings().all()
+        has_more = len(rows) > limit
+        page_rows = rows[:limit]
+        items = tuple(_administration_permission(row) for row in page_rows)
+        return AdministrationPage(
+            items=items,
+            next_cursor=str(page_rows[-1]["id"]) if has_more and page_rows else None,
+        )
+
+    def create_administration_role(
+        self,
+        *,
+        context: AccessContext,
+        role_key: str,
+        name: str,
+        description: str | None,
+        permission_ids: tuple[str, ...],
+        request_id: str | None,
+        occurred_at: datetime,
+    ) -> AdministrationRole:
+        """Create one tenant-owned custom role and append its audit fact."""
+
+        role_id = str(uuid4())
+        try:
+            with self.engine.begin() as connection:
+                _lock_administration_organization(connection, context.organization_id)
+                _revalidate_access_context(
+                    connection,
+                    context,
+                    occurred_at=occurred_at,
+                    required_any=(PermissionCode.ROLES_ASSIGN,),
+                )
+                permission_values = _permission_values_for_ids(connection, permission_ids)
+                connection.execute(
+                    roles.insert().values(
+                        id=role_id,
+                        organization_id=context.organization_id,
+                        role_key=role_key,
+                        name=name,
+                        description=description,
+                        is_system=False,
+                        created_at=occurred_at,
+                        updated_at=occurred_at,
+                    )
+                )
+                _replace_role_permission_rows(
+                    connection,
+                    role_id=role_id,
+                    permission_ids=permission_values,
+                    actor_user_id=context.user_id,
+                    occurred_at=occurred_at,
+                )
+                _append_identity_audit(
+                    connection,
+                    occurred_at=occurred_at,
+                    request_id=request_id,
+                    organization_id=context.organization_id,
+                    actor_kind="user",
+                    actor_membership_id=context.membership_id,
+                    actor_user_id=context.user_id,
+                    action="identity.role.create",
+                    resource_type="role",
+                    resource_id=role_id,
+                    details={"role_keys": (role_key,)},
+                )
+                return _administration_role_by_id(
+                    connection,
+                    context.organization_id,
+                    role_id,
+                )
+        except IntegrityError:
+            raise AdministrationRoleKeyConflictError from None
+
+    def update_administration_role(
+        self,
+        *,
+        context: AccessContext,
+        role_id: str,
+        name: str,
+        description: str | None,
+        permission_ids: tuple[str, ...],
+        expected_version: int,
+        request_id: str | None,
+        occurred_at: datetime,
+    ) -> AdministrationRole:
+        """Update a custom role and invalidate every affected authorization."""
+
+        with self.engine.begin() as connection:
+            _lock_administration_organization(connection, context.organization_id)
+            _revalidate_access_context(
+                connection,
+                context,
+                occurred_at=occurred_at,
+                required_any=(PermissionCode.ROLES_ASSIGN,),
+            )
+            role = _locked_administration_role(
+                connection,
+                context.organization_id,
+                role_id,
+                expected_version,
+            )
+            if bool(role["is_system"]):
+                raise AdministrationSystemRoleImmutableError
+            permission_values = _permission_values_for_ids(connection, permission_ids)
+            permission_keys = tuple(sorted(permission_values))
+            previous_keys = _role_permission_keys(connection, role_id)
+            permissions_changed = previous_keys != permission_keys
+            affected_memberships = _role_membership_ids(
+                connection,
+                context.organization_id,
+                role_id,
+            )
+            if permissions_changed:
+                actor_was_full_manager = bool(
+                    context.membership_id in affected_memberships
+                    and _membership_has_full_management(
+                        connection,
+                        context.organization_id,
+                        context.membership_id,
+                    )
+                )
+                organization_had_full_manager = _organization_has_full_manager(
+                    connection,
+                    context.organization_id,
+                )
+                connection.execute(
+                    delete(role_permissions).where(role_permissions.c.role_id == role_id)
+                )
+                _replace_role_permission_rows(
+                    connection,
+                    role_id=role_id,
+                    permission_ids=permission_values,
+                    actor_user_id=context.user_id,
+                    occurred_at=occurred_at,
+                )
+                if (
+                    actor_was_full_manager
+                    and not _membership_has_full_management(
+                        connection,
+                        context.organization_id,
+                        context.membership_id,
+                    )
+                ):
+                    raise AdministrationSelfLockoutError
+                if (
+                    organization_had_full_manager
+                    and not _organization_has_full_manager(
+                        connection,
+                        context.organization_id,
+                    )
+                ):
+                    raise AdministrationLastManagerError
+
+            changed = connection.execute(
+                update(roles)
+                .where(
+                    roles.c.id == role_id,
+                    roles.c.organization_id == context.organization_id,
+                    roles.c.version == expected_version,
+                )
+                .values(
+                    name=name,
+                    description=description,
+                    updated_at=occurred_at,
+                    version=roles.c.version + 1,
+                )
+            )
+            if changed.rowcount != 1:
+                raise AdministrationVersionConflictError
+            if permissions_changed and affected_memberships:
+                connection.execute(
+                    update(organization_memberships)
+                    .where(
+                        organization_memberships.c.organization_id
+                        == context.organization_id,
+                        organization_memberships.c.id.in_(affected_memberships),
+                    )
+                    .values(
+                        authorization_version=
+                        organization_memberships.c.authorization_version + 1,
+                        updated_at=occurred_at,
+                        version=organization_memberships.c.version + 1,
+                    )
+                )
+            _append_identity_audit(
+                connection,
+                occurred_at=occurred_at,
+                request_id=request_id,
+                organization_id=context.organization_id,
+                actor_kind="user",
+                actor_membership_id=context.membership_id,
+                actor_user_id=context.user_id,
+                action="identity.role.update",
+                resource_type="role",
+                resource_id=role_id,
+                details={"role_keys": (str(role["role_key"]),)},
+            )
+            return _administration_role_by_id(
+                connection,
+                context.organization_id,
+                role_id,
+            )
+
+    def delete_administration_role(
+        self,
+        *,
+        context: AccessContext,
+        role_id: str,
+        expected_version: int,
+        request_id: str | None,
+        occurred_at: datetime,
+    ) -> None:
+        """Delete only an unused custom role and audit in the same transaction."""
+
+        with self.engine.begin() as connection:
+            _lock_administration_organization(connection, context.organization_id)
+            _revalidate_access_context(
+                connection,
+                context,
+                occurred_at=occurred_at,
+                required_any=(PermissionCode.ROLES_ASSIGN,),
+            )
+            role = _locked_administration_role(
+                connection,
+                context.organization_id,
+                role_id,
+                expected_version,
+            )
+            if bool(role["is_system"]):
+                raise AdministrationSystemRoleImmutableError
+            assigned = connection.execute(
+                select(membership_roles.c.membership_id)
+                .where(
+                    membership_roles.c.organization_id == context.organization_id,
+                    membership_roles.c.role_id == role_id,
+                )
+                .limit(1)
+                .with_for_update()
+            ).scalar_one_or_none()
+            if assigned is not None:
+                raise AdministrationRoleInUseError
+            connection.execute(
+                delete(role_permissions).where(role_permissions.c.role_id == role_id)
+            )
+            deleted = connection.execute(
+                delete(roles).where(
+                    roles.c.id == role_id,
+                    roles.c.organization_id == context.organization_id,
+                    roles.c.version == expected_version,
+                )
+            )
+            if deleted.rowcount != 1:
+                raise AdministrationVersionConflictError
+            _append_identity_audit(
+                connection,
+                occurred_at=occurred_at,
+                request_id=request_id,
+                organization_id=context.organization_id,
+                actor_kind="user",
+                actor_membership_id=context.membership_id,
+                actor_user_id=context.user_id,
+                action="identity.role.delete",
+                resource_type="role",
+                resource_id=role_id,
+                details={"role_keys": (str(role["role_key"]),)},
+            )
+
+    def list_administration_audit_events(
+        self,
+        context: AccessContext,
+        *,
+        cursor: str | None,
+        limit: int,
+        action: str | None,
+        outcome: str | None,
+        read_at: datetime,
+    ) -> AdministrationAuditPage:
+        """Return only the redacted audit projection for one exact tenant."""
+
+        statement = (
+            select(
+                audit_events.c.id,
+                audit_events.c.occurred_at,
+                audit_events.c.request_id,
+                audit_events.c.actor_kind,
+                audit_events.c.actor_user_id,
+                audit_events.c.action,
+                audit_events.c.resource_type,
+                audit_events.c.resource_id,
+                audit_events.c.outcome,
+                audit_events.c.error_code,
+                audit_events.c.details,
+            )
+            .where(audit_events.c.organization_id == context.organization_id)
+            .order_by(audit_events.c.id.desc())
+            .limit(limit + 1)
+        )
+        if cursor is not None:
+            statement = statement.where(audit_events.c.id < int(cursor))
+        if action is not None:
+            statement = statement.where(audit_events.c.action == action)
+        if outcome is not None:
+            statement = statement.where(audit_events.c.outcome == outcome)
+        with self.engine.begin() as connection:
+            _lock_administration_organization(connection, context.organization_id)
+            _revalidate_access_context(
+                connection,
+                context,
+                occurred_at=read_at,
+                required_any=(PermissionCode.AUDIT_READ,),
+            )
+            rows = connection.execute(statement).mappings().all()
+        has_more = len(rows) > limit
+        page_rows = rows[:limit]
+        items = tuple(_administration_audit_event(row) for row in page_rows)
+        return AdministrationAuditPage(
             items=items,
             next_cursor=str(page_rows[-1]["id"]) if has_more and page_rows else None,
         )
@@ -1526,10 +2141,186 @@ def _revalidate_actor_snapshot(
     ):
         raise AuthenticationRequiredError
     current_permissions = _permission_values(connection, membership_id)
-    if not any(permission in current_permissions for permission in required_any):
+    if required_any and not any(
+        permission in current_permissions for permission in required_any
+    ):
         raise PermissionDeniedError(
             "|".join(permission.value for permission in required_any)
         )
+
+
+def _locked_administration_role(
+    connection: Connection,
+    organization_id: str,
+    role_id: str,
+    expected_version: int,
+) -> Mapping[str, object]:
+    row = connection.execute(
+        select(
+            roles.c.id,
+            roles.c.role_key,
+            roles.c.is_system,
+            roles.c.version,
+        )
+        .where(
+            roles.c.id == role_id,
+            roles.c.organization_id == organization_id,
+        )
+        .with_for_update()
+    ).mappings().one_or_none()
+    if row is None:
+        raise AdministrationResourceNotFoundError
+    if int(row["version"]) != expected_version:
+        raise AdministrationVersionConflictError
+    return row
+
+
+def _permission_values_for_ids(
+    connection: Connection,
+    permission_ids: tuple[str, ...],
+) -> dict[str, str]:
+    if not permission_ids:
+        return {}
+    rows = connection.execute(
+        select(permissions.c.id, permissions.c.permission_key)
+        .where(
+            permissions.c.id.in_(permission_ids),
+            permissions.c.permission_key.in_(
+                tuple(permission.value for permission in PermissionCode)
+            ),
+        )
+        .with_for_update()
+    ).mappings().all()
+    result = {str(row["permission_key"]): str(row["id"]) for row in rows}
+    if set(result.values()) != set(permission_ids):
+        raise AdministrationScopeConflictError
+    return result
+
+
+def _replace_role_permission_rows(
+    connection: Connection,
+    *,
+    role_id: str,
+    permission_ids: Mapping[str, str],
+    actor_user_id: str,
+    occurred_at: datetime,
+) -> None:
+    if not permission_ids:
+        return
+    connection.execute(
+        role_permissions.insert(),
+        [
+            {
+                "role_id": role_id,
+                "permission_id": permission_ids[key],
+                "granted_by_user_id": actor_user_id,
+                "granted_at": occurred_at,
+                "created_at": occurred_at,
+            }
+            for key in sorted(permission_ids)
+        ],
+    )
+
+
+def _role_permission_keys(
+    connection: Connection,
+    role_id: str,
+) -> tuple[str, ...]:
+    values = connection.execute(
+        select(permissions.c.permission_key)
+        .select_from(
+            role_permissions.join(
+                permissions,
+                permissions.c.id == role_permissions.c.permission_id,
+            )
+        )
+        .where(role_permissions.c.role_id == role_id)
+        .order_by(permissions.c.permission_key)
+    ).scalars().all()
+    return tuple(str(value) for value in values)
+
+
+def _role_membership_ids(
+    connection: Connection,
+    organization_id: str,
+    role_id: str,
+) -> tuple[str, ...]:
+    values = connection.execute(
+        select(membership_roles.c.membership_id)
+        .where(
+            membership_roles.c.organization_id == organization_id,
+            membership_roles.c.role_id == role_id,
+        )
+        .order_by(membership_roles.c.membership_id)
+        .with_for_update()
+    ).scalars().all()
+    return tuple(str(value) for value in values)
+
+
+def _membership_has_full_management(
+    connection: Connection,
+    organization_id: str,
+    membership_id: str,
+) -> bool:
+    values = connection.execute(
+        select(permissions.c.permission_key)
+        .select_from(
+            membership_roles.join(
+                roles,
+                and_(
+                    roles.c.id == membership_roles.c.role_id,
+                    roles.c.organization_id == membership_roles.c.organization_id,
+                ),
+            )
+            .join(
+                role_permissions,
+                role_permissions.c.role_id == membership_roles.c.role_id,
+            )
+            .join(
+                permissions,
+                permissions.c.id == role_permissions.c.permission_id,
+            )
+        )
+        .where(
+            membership_roles.c.organization_id == organization_id,
+            membership_roles.c.membership_id == membership_id,
+            permissions.c.permission_key.in_(
+                (
+                    PermissionCode.USERS_MANAGE.value,
+                    PermissionCode.ROLES_ASSIGN.value,
+                )
+            ),
+        )
+    ).scalars().all()
+    return {
+        PermissionCode.USERS_MANAGE.value,
+        PermissionCode.ROLES_ASSIGN.value,
+    }.issubset({str(value) for value in values})
+
+
+def _organization_has_full_manager(
+    connection: Connection,
+    organization_id: str,
+) -> bool:
+    membership_ids = connection.execute(
+        select(organization_memberships.c.id)
+        .select_from(
+            organization_memberships.join(
+                users,
+                users.c.id == organization_memberships.c.user_id,
+            )
+        )
+        .where(
+            organization_memberships.c.organization_id == organization_id,
+            organization_memberships.c.status == "active",
+            users.c.status == "active",
+            users.c.deleted_at.is_(None),
+        )
+    ).scalars().all()
+    return any(
+        _membership_has_full_management(connection, organization_id, str(value))
+        for value in membership_ids
+    )
 
 
 def _locked_organization_roles(
@@ -1882,6 +2673,104 @@ def _append_administration_audit(
     )
 
 
+def _append_identity_audit(
+    connection: Connection,
+    *,
+    occurred_at: datetime,
+    request_id: str | None,
+    organization_id: str | None,
+    actor_kind: str,
+    actor_membership_id: str | None,
+    actor_user_id: str | None,
+    action: str,
+    resource_type: str,
+    resource_id: str | None,
+    details: Mapping[str, object] | None = None,
+) -> None:
+    """Append one already-authorized identity audit fact in its write transaction."""
+
+    connection.execute(
+        audit_events.insert().values(
+            occurred_at=occurred_at,
+            request_id=request_id,
+            organization_id=organization_id,
+            actor_kind=actor_kind,
+            actor_membership_id=actor_membership_id,
+            actor_user_id=actor_user_id,
+            action=action,
+            resource_type=resource_type,
+            resource_id=resource_id,
+            outcome="success",
+            details=sanitize_audit_details(details or {}),
+        )
+    )
+
+
+def _administration_role_by_id(
+    connection: Connection,
+    organization_id: str,
+    role_id: str,
+) -> AdministrationRole:
+    row = connection.execute(
+        select(
+            roles.c.id,
+            roles.c.role_key,
+            roles.c.name,
+            roles.c.description,
+            roles.c.is_system,
+            roles.c.version,
+        ).where(
+            roles.c.organization_id == organization_id,
+            roles.c.id == role_id,
+        )
+    ).mappings().one_or_none()
+    if row is None:
+        raise AdministrationResourceNotFoundError
+    permission_values = _administration_permissions_by_role(
+        connection,
+        organization_id,
+        [role_id],
+    )
+    return _administration_role(row, permission_values)
+
+
+def _administration_audit_event(row: Mapping[str, object]) -> AdministrationAuditEvent:
+    raw_details = row["details"]
+    details: dict[str, object]
+    if isinstance(raw_details, Mapping):
+        try:
+            details = {
+                key: list(value) if isinstance(value, tuple) else value
+                for key, value in sanitize_audit_details(raw_details).items()
+            }
+        except AuditValidationError:
+            # Historical rows created before the strict allowlist are reduced
+            # to an empty detail object rather than leaking unknown payloads.
+            details = {}
+    else:
+        details = {}
+    occurred_at = row["occurred_at"]
+    if not isinstance(occurred_at, datetime):
+        raise RuntimeError("audit occurred_at must be a datetime")
+    return AdministrationAuditEvent(
+        id=int(row["id"]),
+        occurred_at=occurred_at,
+        request_id=str(row["request_id"]) if row["request_id"] is not None else None,
+        actor_kind=str(row["actor_kind"]),
+        actor_user_id=(
+            str(row["actor_user_id"])
+            if row["actor_user_id"] is not None
+            else None
+        ),
+        action=str(row["action"]),
+        resource_type=str(row["resource_type"]),
+        resource_id=str(row["resource_id"]) if row["resource_id"] is not None else None,
+        outcome=str(row["outcome"]),
+        error_code=str(row["error_code"]) if row["error_code"] is not None else None,
+        details=details,
+    )
+
+
 def _administration_roles_by_membership(
     connection: Connection,
     organization_id: str,
@@ -1896,6 +2785,7 @@ def _administration_roles_by_membership(
             roles.c.role_key,
             roles.c.name,
             roles.c.description,
+            roles.c.is_system,
             roles.c.version,
         )
         .select_from(
@@ -1966,6 +2856,18 @@ def _administration_facility(row: Mapping[str, object]) -> AdministrationFacilit
     )
 
 
+def _administration_permission(row: Mapping[str, object]) -> AdministrationPermission:
+    description = row["description"]
+    return AdministrationPermission(
+        id=str(row["id"]),
+        permission_key=str(row["permission_key"]),
+        resource=str(row["resource"]),
+        action=str(row["action"]),
+        description=str(description) if description is not None else None,
+        version=int(row["version"]),
+    )
+
+
 def _administration_role(
     row: Mapping[str, object],
     permission_values: Mapping[str, tuple[str, ...]],
@@ -1979,6 +2881,7 @@ def _administration_role(
         description=str(description) if description is not None else None,
         permissions=permission_values.get(role_id, ()),
         version=int(row["version"]),
+        is_system=bool(row["is_system"]),
     )
 
 
@@ -2038,6 +2941,95 @@ def _normalized_facility_catalog(
         if previous is None or (display_name is not None and display_name > previous):
             catalog[facility_key] = display_name
     return dict(sorted(catalog.items()))
+
+
+def _password_reset_statement(token_hash: bytes, *, for_update: bool = False):
+    reset_context = (
+        one_time_tokens.join(users, users.c.id == one_time_tokens.c.user_id)
+        .join(
+            organization_memberships,
+            and_(
+                organization_memberships.c.id == one_time_tokens.c.membership_id,
+                organization_memberships.c.user_id == one_time_tokens.c.user_id,
+                organization_memberships.c.organization_id
+                == one_time_tokens.c.organization_id,
+            ),
+        )
+        .join(organizations, organizations.c.id == one_time_tokens.c.organization_id)
+    )
+    statement = (
+        select(
+            one_time_tokens.c.organization_id,
+            one_time_tokens.c.membership_id,
+            one_time_tokens.c.user_id,
+            one_time_tokens.c.identity_version.label("token_identity_version"),
+            one_time_tokens.c.expires_at,
+            one_time_tokens.c.consumed_at,
+            one_time_tokens.c.version.label("token_version"),
+            users.c.email_normalized,
+            users.c.status.label("user_status"),
+            users.c.auth_version,
+            users.c.version.label("user_version"),
+            users.c.deleted_at.label("user_deleted_at"),
+            organization_memberships.c.status.label("membership_status"),
+            organizations.c.status.label("organization_status"),
+            organizations.c.deleted_at.label("organization_deleted_at"),
+        )
+        .select_from(reset_context)
+        .where(
+            one_time_tokens.c.token_hash == token_hash,
+            one_time_tokens.c.purpose == PASSWORD_RESET_PURPOSE,
+        )
+    )
+    return statement.with_for_update() if for_update else statement
+
+
+def _password_reset_challenge(
+    row: Mapping[str, object] | None,
+    *,
+    now: datetime,
+) -> PasswordResetChallenge | None:
+    if row is None:
+        return None
+    expires_at = row["expires_at"]
+    if not bool(
+        row["consumed_at"] is None
+        and isinstance(expires_at, datetime)
+        and expires_at > now
+        and row["user_status"] == "active"
+        and row["user_deleted_at"] is None
+        and row["membership_status"] == "active"
+        and row["organization_status"] == "active"
+        and row["organization_deleted_at"] is None
+        and int(row["token_identity_version"]) == int(row["auth_version"])
+        and isinstance(row["email_normalized"], str)
+    ):
+        return None
+    return PasswordResetChallenge(
+        user_id=str(row["user_id"]),
+        organization_id=str(row["organization_id"]),
+        membership_id=str(row["membership_id"]),
+        email_normalized=str(row["email_normalized"]),
+        identity_version=int(row["auth_version"]),
+        user_version=int(row["user_version"]),
+        token_version=int(row["token_version"]),
+    )
+
+
+def _password_reset_plan_matches(
+    challenge: PasswordResetChallenge,
+    plan: PasswordResetPlan,
+) -> bool:
+    return bool(
+        challenge.user_id == plan.expected_user_id
+        and challenge.organization_id == plan.expected_organization_id
+        and challenge.membership_id == plan.expected_membership_id
+        and challenge.identity_version == plan.expected_identity_version
+        and challenge.user_version == plan.expected_user_version
+        and challenge.token_version == plan.expected_token_version
+        and plan.password_algorithm == "argon2id"
+        and bool(plan.password_hash)
+    )
 
 
 def _invitation_registration_statement(

@@ -54,6 +54,24 @@ class CsrfValidationError(AuthenticationError):
         super().__init__("请求安全校验失败，请刷新页面后重试")
 
 
+class InvalidCurrentPasswordError(AuthenticationError):
+    """Raised when an authenticated password-change proof is incorrect."""
+
+    error_code = "current_password_invalid"
+
+    def __init__(self) -> None:
+        super().__init__("当前密码不正确")
+
+
+class InvalidPasswordResetError(AuthenticationError):
+    """Indistinguishable response for wrong, expired, used, or stale tokens."""
+
+    error_code = "password_reset_unavailable"
+
+    def __init__(self) -> None:
+        super().__init__("密码重置凭证无效或已过期，请重新申请")
+
+
 class BootstrapAlreadyCompletedError(AuthenticationError):
     """Raised when the one-time administrator bootstrap was already used."""
 
@@ -122,6 +140,36 @@ class AdministrationVersionConflictError(AdministrationError):
 
     def __init__(self) -> None:
         super().__init__("管理对象已被其他请求修改，请刷新后重试")
+
+
+class AdministrationRoleKeyConflictError(AdministrationError):
+    """A tenant-local role key already belongs to another role."""
+
+    error_code = "ADMIN_ROLE_KEY_CONFLICT"
+    http_status = 409
+
+    def __init__(self) -> None:
+        super().__init__("角色标识已被使用")
+
+
+class AdministrationSystemRoleImmutableError(AdministrationError):
+    """Built-in roles are deployment policy and cannot be mutated by tenants."""
+
+    error_code = "ADMIN_SYSTEM_ROLE_IMMUTABLE"
+    http_status = 409
+
+    def __init__(self) -> None:
+        super().__init__("系统角色不能修改或删除")
+
+
+class AdministrationRoleInUseError(AdministrationError):
+    """Assigned roles must be unbound before they can be deleted."""
+
+    error_code = "ADMIN_ROLE_IN_USE"
+    http_status = 409
+
+    def __init__(self) -> None:
+        super().__init__("角色仍已分配给成员，请先解除分配")
 
 
 class AdministrationScopeConflictError(AdministrationError):

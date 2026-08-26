@@ -21,6 +21,7 @@ from sqlalchemy import (
     Index,
     Integer,
     MetaData,
+    Numeric,
     SmallInteger,
     String,
     Table,
@@ -387,8 +388,8 @@ one_time_tokens = Table(
     ),
     UniqueConstraint("token_hash", name="uq_one_time_tokens_token_hash"),
     CheckConstraint(
-        "purpose = 'user_invitation'",
-        name="ck_one_time_tokens_invitation_purpose",
+        "purpose IN ('user_invitation', 'password_reset')",
+        name="ck_one_time_tokens_purpose",
     ),
     CheckConstraint(
         "identity_version >= 1",
@@ -755,6 +756,86 @@ membership_facility_scopes = Table(
 )
 
 
+analysis_history = Table(
+    "analysis_history",
+    identity_metadata,
+    Column("id", BigInteger, primary_key=True, autoincrement=True),
+    Column("organization_id", CHAR(36), nullable=False),
+    Column("membership_id", CHAR(36), nullable=False),
+    Column("user_id", CHAR(36), nullable=False),
+    Column(
+        "history_type",
+        String(16),
+        nullable=False,
+        comment="Originating governed workflow: query or agent.",
+    ),
+    Column("title", String(200), nullable=False),
+    Column("question", String(2000), nullable=True),
+    Column(
+        "query_spec",
+        JSON,
+        nullable=True,
+        comment="Validated QuerySpec only; never aggregate or patient result rows.",
+    ),
+    Column(
+        "chart_spec",
+        JSON,
+        nullable=True,
+        comment="Validated declarative ChartSpec; never executable JavaScript.",
+    ),
+    Column("row_count", BigInteger, nullable=False, server_default=text("0")),
+    Column("truncated", Boolean, nullable=False, server_default=text("0")),
+    Column(
+        "query_time_ms",
+        Numeric(12, 3),
+        nullable=False,
+        server_default=text("0"),
+    ),
+    Column("is_favorite", Boolean, nullable=False, server_default=text("0")),
+    _created_at_column(),
+    _updated_at_column(),
+    _version_column(),
+    ForeignKeyConstraint(
+        ("membership_id", "user_id", "organization_id"),
+        (
+            "organization_memberships.id",
+            "organization_memberships.user_id",
+            "organization_memberships.organization_id",
+        ),
+        name="fk_analysis_history_membership_context",
+        ondelete="CASCADE",
+    ),
+    CheckConstraint(
+        "history_type IN ('query', 'agent')",
+        name="ck_analysis_history_type",
+    ),
+    CheckConstraint(
+        "history_type = 'agent' OR query_spec IS NOT NULL",
+        name="ck_analysis_history_query_spec",
+    ),
+    CheckConstraint("row_count >= 0", name="ck_analysis_history_row_count"),
+    CheckConstraint("query_time_ms >= 0", name="ck_analysis_history_query_time"),
+    CheckConstraint("version >= 1", name="ck_analysis_history_version_positive"),
+    Index(
+        "ix_analysis_history_context_id",
+        "membership_id",
+        "user_id",
+        "organization_id",
+        "id",
+    ),
+    Index(
+        "ix_analysis_history_context_favorite_id",
+        "membership_id",
+        "user_id",
+        "organization_id",
+        "is_favorite",
+        "id",
+    ),
+    comment="Per-membership governed analysis history without result-row persistence.",
+    **TABLE_OPTIONS,
+)
+
+
 BASE_IDENTITY_TABLE_NAMES = (
     "users",
     "organizations",
@@ -776,7 +857,13 @@ SCOPE_IDENTITY_TABLE_NAMES = (
     "membership_facility_scopes",
 )
 
-ALL_IDENTITY_TABLE_NAMES = BASE_IDENTITY_TABLE_NAMES + SCOPE_IDENTITY_TABLE_NAMES
+DEMO_COMPLETION_TABLE_NAMES = ("analysis_history",)
+
+ALL_IDENTITY_TABLE_NAMES = (
+    BASE_IDENTITY_TABLE_NAMES
+    + SCOPE_IDENTITY_TABLE_NAMES
+    + DEMO_COMPLETION_TABLE_NAMES
+)
 
 # Descriptive alias retained for callers that refer to the facility-scope
 # migration by feature rather than by control-plane layer.

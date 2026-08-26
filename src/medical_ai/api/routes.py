@@ -3,11 +3,14 @@ from __future__ import annotations
 from typing import Any, cast
 
 from flask import Blueprint, current_app, request
+from sqlalchemy.exc import SQLAlchemyError
 
 from medical_ai.api.errors import APIError
+from medical_ai.api.history_routes import get_history_service
 from medical_ai.api.responses import success_response
 from medical_ai.api.security import access_context
 from medical_ai.config import Settings
+from medical_ai.history import HistoryError
 from medical_ai.services import AnalyticsService, ServiceResult
 
 api_v1 = Blueprint("api_v1", __name__, url_prefix="/api/v1")
@@ -68,12 +71,16 @@ def query():
             field_errors=[{"field": "query_spec", "message": "必须是 JSON 对象"}],
         )
     if _auth_enforced():
-        return _respond(
-            _service().query_authorized(
-                query_spec,
-                access_context(require_csrf=True),
-            )
+        context = access_context(require_csrf=True)
+        result = _service().query_authorized(query_spec, context)
+        _record_history_safely(
+            get_history_service().record_query,
+            context,
+            query_spec,
+            result_data=result.data,
+            query_time_ms=result.query_time_ms,
         )
+        return _respond(result)
     return _respond(_service().query(query_spec))
 
 
@@ -108,13 +115,16 @@ def ask():
             field_errors=[{"field": "execute", "message": "必须是布尔值"}],
         )
     if _auth_enforced():
-        return _respond(
-            _service().ask_authorized(
-                question,
-                access_context(require_csrf=True),
-                execute=execute,
-            )
+        context = access_context(require_csrf=True)
+        result = _service().ask_authorized(question, context, execute=execute)
+        _record_history_safely(
+            get_history_service().record_agent,
+            context,
+            question,
+            result_data=result.data,
+            query_time_ms=result.query_time_ms,
         )
+        return _respond(result)
     return _respond(_service().ask(question, execute=execute))
 
 
@@ -130,6 +140,18 @@ def _auth_enforced() -> bool:
     """Use the governed path when explicitly enabled for this deployment."""
 
     return bool(getattr(_settings(), "auth_enforcement_enabled", False))
+
+
+def _record_history_safely(callback, *args: Any, **kwargs: Any) -> None:
+    """Keep optional history persistence outside the core analytics failure domain."""
+
+    try:
+        callback(*args, **kwargs)
+    except (HistoryError, SQLAlchemyError) as exc:
+        current_app.logger.warning(
+            "analysis history persistence skipped",
+            extra={"history_error_category": type(exc).__name__},
+        )
 
 
 def _respond(result: ServiceResult):

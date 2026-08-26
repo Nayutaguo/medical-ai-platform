@@ -12,7 +12,9 @@ from medical_ai.identity.errors import (
     AuthenticationRequiredError,
     CsrfValidationError,
     InvalidCredentialsError,
+    InvalidCurrentPasswordError,
     InvalidInvitationError,
+    InvalidPasswordResetError,
     InvitationCreationError,
     MembershipUnavailableError,
     OrganizationSelectionRequiredError,
@@ -107,6 +109,32 @@ def register_error_handlers(app: Flask) -> None:
         return error_response(
             status=400,
             code="INVALID_INVITATION",
+            message=str(exc),
+        )
+
+    @app.errorhandler(InvalidCurrentPasswordError)
+    def handle_invalid_current_password(exc: InvalidCurrentPasswordError):
+        app.logger.warning(
+            "password_change_denied request_id=%s code=%s",
+            current_request_id(),
+            exc.error_code,
+        )
+        return error_response(
+            status=400,
+            code="CURRENT_PASSWORD_INVALID",
+            message=str(exc),
+        )
+
+    @app.errorhandler(InvalidPasswordResetError)
+    def handle_invalid_password_reset(exc: InvalidPasswordResetError):
+        app.logger.warning(
+            "password_reset_denied request_id=%s code=%s",
+            current_request_id(),
+            exc.error_code,
+        )
+        return error_response(
+            status=400,
+            code="PASSWORD_RESET_INVALID",
             message=str(exc),
         )
 

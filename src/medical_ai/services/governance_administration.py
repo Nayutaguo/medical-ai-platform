@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from datetime import UTC, datetime, timedelta
 
 from medical_ai.authorization import AccessContext, PermissionCode, require_permission
@@ -13,7 +14,9 @@ from medical_ai.identity.errors import (
 from medical_ai.identity.emails import normalize_ascii_email
 from medical_ai.identity.models import (
     AdministrationMember,
+    AdministrationAuditPage,
     AdministrationPage,
+    AdministrationRole,
     FacilityCatalogSyncResult,
     IssuedUserInvitation,
 )
@@ -26,6 +29,9 @@ MAX_PAGE_LIMIT = 100
 MAX_ROLE_ASSIGNMENTS = 16
 MAX_FACILITY_ASSIGNMENTS = 1_000
 ALLOWED_MEMBERSHIP_STATUSES = frozenset({"active", "suspended"})
+ALLOWED_AUDIT_OUTCOMES = frozenset({"success", "denied", "failure"})
+ROLE_KEY_PATTERN = re.compile(r"^[a-z][a-z0-9_-]{0,99}$")
+AUDIT_ACTION_PATTERN = re.compile(r"^[a-z][a-z0-9_.:-]{0,119}$")
 
 
 class GovernanceAdministrationService:
@@ -88,6 +94,122 @@ class GovernanceAdministrationService:
             context.organization_id,
             cursor=_validated_cursor(cursor),
             limit=_validated_limit(limit),
+        )
+
+    def list_permissions(
+        self,
+        context: AccessContext,
+        *,
+        cursor: str | None = None,
+        limit: int = DEFAULT_PAGE_LIMIT,
+    ) -> AdministrationPage:
+        """List application-known permission records for role composition."""
+
+        require_permission(context, PermissionCode.ROLES_ASSIGN)
+        return self.repository.list_administration_permissions(
+            cursor=_validated_cursor(cursor),
+            limit=_validated_limit(limit),
+        )
+
+    def create_role(
+        self,
+        context: AccessContext,
+        *,
+        role_key: object,
+        name: object,
+        description: object,
+        permission_ids: object,
+        request_id: str | None,
+        now: datetime | None = None,
+    ) -> AdministrationRole:
+        """Create a tenant-local custom role from global permission IDs."""
+
+        require_permission(context, PermissionCode.ROLES_ASSIGN)
+        normalized_role_key = _validated_role_key(role_key)
+        return self.repository.create_administration_role(
+            context=context,
+            role_key=normalized_role_key,
+            name=_validated_role_name(name),
+            description=_validated_role_description(description),
+            permission_ids=_validated_identifier_list(
+                permission_ids,
+                "permission_ids",
+                len(PermissionCode),
+            ),
+            request_id=request_id,
+            occurred_at=_naive_utc_now(now),
+        )
+
+    def update_role(
+        self,
+        context: AccessContext,
+        *,
+        role_id: str,
+        name: object,
+        description: object,
+        permission_ids: object,
+        expected_version: object,
+        request_id: str | None,
+        now: datetime | None = None,
+    ) -> AdministrationRole:
+        """Update a custom role using optimistic locking."""
+
+        require_permission(context, PermissionCode.ROLES_ASSIGN)
+        return self.repository.update_administration_role(
+            context=context,
+            role_id=_validated_identifier(role_id, "role_id"),
+            name=_validated_role_name(name),
+            description=_validated_role_description(description),
+            permission_ids=_validated_identifier_list(
+                permission_ids,
+                "permission_ids",
+                len(PermissionCode),
+            ),
+            expected_version=_validated_version(expected_version),
+            request_id=request_id,
+            occurred_at=_naive_utc_now(now),
+        )
+
+    def delete_role(
+        self,
+        context: AccessContext,
+        *,
+        role_id: str,
+        expected_version: object,
+        request_id: str | None,
+        now: datetime | None = None,
+    ) -> None:
+        """Delete an unused custom role using optimistic locking."""
+
+        require_permission(context, PermissionCode.ROLES_ASSIGN)
+        self.repository.delete_administration_role(
+            context=context,
+            role_id=_validated_identifier(role_id, "role_id"),
+            expected_version=_validated_version(expected_version),
+            request_id=request_id,
+            occurred_at=_naive_utc_now(now),
+        )
+
+    def list_audit_events(
+        self,
+        context: AccessContext,
+        *,
+        cursor: object = None,
+        limit: object = DEFAULT_PAGE_LIMIT,
+        action: object = None,
+        outcome: object = None,
+        now: datetime | None = None,
+    ) -> AdministrationAuditPage:
+        """List a redacted audit page for the current tenant only."""
+
+        require_permission(context, PermissionCode.AUDIT_READ)
+        return self.repository.list_administration_audit_events(
+            context,
+            cursor=_validated_audit_cursor(cursor),
+            limit=_validated_limit(limit),
+            action=_validated_audit_action(action),
+            outcome=_validated_audit_outcome(outcome),
+            read_at=_naive_utc_now(now),
         )
 
     def issue_invitation(
@@ -260,6 +382,58 @@ def _validated_version(value: object) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 1:
         raise AdministrationValidationError("expected_version 必须是正整数")
     return value
+
+
+def _validated_role_key(value: object) -> str:
+    normalized = value.strip().casefold() if isinstance(value, str) else ""
+    if not ROLE_KEY_PATTERN.fullmatch(normalized):
+        raise AdministrationValidationError(
+            "role_key 只能使用小写字母、数字、下划线或连字符"
+        )
+    return normalized
+
+
+def _validated_role_name(value: object) -> str:
+    if not isinstance(value, str) or not value.strip() or len(value.strip()) > 120:
+        raise AdministrationValidationError("name 必须是 1 到 120 个字符")
+    return value.strip()
+
+
+def _validated_role_description(value: object) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or len(value) > 2_000:
+        raise AdministrationValidationError("description 最多 2000 个字符")
+    return value.strip() or None
+
+
+def _validated_audit_cursor(value: object) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.isascii() or not value.isdigit():
+        raise AdministrationValidationError("cursor 格式不正确")
+    numeric = int(value)
+    if numeric < 1 or numeric > 9_223_372_036_854_775_807:
+        raise AdministrationValidationError("cursor 格式不正确")
+    return str(numeric)
+
+
+def _validated_audit_action(value: object) -> str | None:
+    if value is None:
+        return None
+    normalized = value.strip() if isinstance(value, str) else ""
+    if not AUDIT_ACTION_PATTERN.fullmatch(normalized):
+        raise AdministrationValidationError("action 格式不正确")
+    return normalized
+
+
+def _validated_audit_outcome(value: object) -> str | None:
+    if value is None:
+        return None
+    normalized = value.strip().casefold() if isinstance(value, str) else ""
+    if normalized not in ALLOWED_AUDIT_OUTCOMES:
+        raise AdministrationValidationError("outcome 只能是 success、denied 或 failure")
+    return normalized
 
 
 def _aware_utc_now(value: datetime | None) -> datetime:

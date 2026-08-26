@@ -28,6 +28,9 @@ def authentication_service() -> AuthenticationService:
             idle_timeout=timedelta(minutes=settings.auth_session_idle_minutes),
             absolute_timeout=timedelta(hours=settings.auth_session_absolute_hours),
             touch_interval=timedelta(minutes=settings.auth_session_touch_minutes),
+            password_reset_lifetime=timedelta(
+                minutes=settings.auth_password_reset_minutes
+            ),
         )
         current_app.extensions["authentication_service"] = service
     return cast(AuthenticationService, service)

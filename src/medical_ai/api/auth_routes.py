@@ -12,6 +12,7 @@ from medical_ai.api.security import (
     authentication_service,
     invitation_registration_service,
     login_rate_limiter,
+    resolve_request_session,
 )
 from medical_ai.config import Settings
 from medical_ai.services import AuthenticationService
@@ -187,6 +188,104 @@ def delete_session():
     return response, status
 
 
+@auth_api.post("/password/change")
+def change_password():
+    """Change the authenticated identity password and revoke all sessions."""
+
+    _require_authentication_enabled()
+    payload = _json_object()
+    _reject_unknown_fields(payload, {"current_password", "new_password"})
+    session = resolve_request_session(require_csrf=True)
+    _service().change_password(
+        session,
+        _required_string(payload, "current_password", maximum=1024),
+        _required_string(payload, "new_password", maximum=1024),
+        request_id=current_request_id(),
+    )
+    response, status = success_response({"changed": True})
+    _expire_authentication_cookies(response)
+    response.headers["Cache-Control"] = "no-store"
+    return response, status
+
+
+@auth_api.post("/password-reset-requests")
+def create_password_reset_request():
+    """Return one enumeration-safe acceptance envelope for reset requests."""
+
+    _require_authentication_enabled()
+    payload = _json_object()
+    _reject_unknown_fields(payload, {"email", "organization_id"})
+    email = _required_string(payload, "email", maximum=320)
+    organization_id = payload.get("organization_id")
+    if organization_id is not None:
+        if not isinstance(organization_id, str) or not organization_id.strip():
+            raise APIError(
+                "INVALID_REQUEST",
+                "organization_id 必须是非空字符串",
+                field_errors=[{"field": "organization_id", "message": "必须是非空字符串"}],
+            )
+        organization_id = organization_id.strip()
+        if len(organization_id) > 36:
+            raise APIError(
+                "INVALID_REQUEST",
+                "organization_id 超过长度限制",
+                field_errors=[{"field": "organization_id", "message": "最多 36 个字符"}],
+            )
+
+    limiter = login_rate_limiter()
+    if limiter is not None:
+        limiter.check(
+            source_ip=request.remote_addr or "",
+            normalized_account=normalize_email(email),
+        )
+    issued = _service().request_password_reset(
+        email,
+        organization_id=organization_id,
+        request_id=current_request_id(),
+    )
+    data: dict[str, object] = {"accepted": True}
+    if _settings().auth_dev_expose_password_reset_token and issued is not None:
+        data.update(
+            {
+                "reset_token": issued.token,
+                "expires_at": issued.expires_at.isoformat(),
+                "organization_id": issued.organization_id,
+            }
+        )
+    response, status = success_response(data, status=202)
+    response.headers["Cache-Control"] = "no-store"
+    return response, status
+
+
+@auth_api.post("/password-resets")
+def reset_password():
+    """Consume a one-time reset token bound to email, organization, and version."""
+
+    _require_authentication_enabled()
+    payload = _json_object()
+    _reject_unknown_fields(
+        payload,
+        {"token", "email", "organization_id", "new_password"},
+    )
+    email = _required_string(payload, "email", maximum=320)
+    limiter = login_rate_limiter()
+    if limiter is not None:
+        limiter.check(
+            source_ip=request.remote_addr or "",
+            normalized_account=normalize_email(email),
+        )
+    _service().reset_password(
+        _required_string(payload, "token", maximum=512),
+        email,
+        _required_string(payload, "organization_id", maximum=36),
+        _required_string(payload, "new_password", maximum=1024),
+        request_id=current_request_id(),
+    )
+    response, status = success_response({"reset": True})
+    response.headers["Cache-Control"] = "no-store"
+    return response, status
+
+
 def _service() -> AuthenticationService:
     return authentication_service()
 
@@ -198,6 +297,24 @@ def _settings() -> Settings:
 def _session_cookie() -> str:
     value = request.cookies.get(_settings().auth_session_cookie_name, "")
     return value if isinstance(value, str) else ""
+
+
+def _expire_authentication_cookies(response) -> None:
+    settings = _settings()
+    response.delete_cookie(
+        settings.auth_session_cookie_name,
+        secure=settings.auth_session_cookie_secure,
+        httponly=True,
+        samesite=settings.auth_session_cookie_samesite,
+        path="/api/v1",
+    )
+    response.delete_cookie(
+        settings.auth_csrf_cookie_name,
+        secure=settings.auth_session_cookie_secure,
+        httponly=False,
+        samesite=settings.auth_session_cookie_samesite,
+        path="/",
+    )
 
 
 def _require_authentication_enabled() -> None:
@@ -234,4 +351,17 @@ def _required_string(payload: dict[str, Any], field: str, *, maximum: int) -> st
             f"{field} 超过长度限制",
             field_errors=[{"field": field, "message": f"最多 {maximum} 个 UTF-8 字节"}],
         )
-    return value.strip() if field != "password" else value
+    return value if field in {"password", "current_password", "new_password"} else value.strip()
+
+
+def _reject_unknown_fields(payload: dict[str, Any], allowed_fields: set[str]) -> None:
+    unknown_fields = sorted(set(payload) - allowed_fields)
+    if unknown_fields:
+        raise APIError(
+            "INVALID_REQUEST",
+            "请求包含不支持的字段",
+            field_errors=[
+                {"field": field, "message": "不支持的字段"}
+                for field in unknown_fields
+            ],
+        )

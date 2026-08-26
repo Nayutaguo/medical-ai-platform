@@ -36,6 +36,8 @@ class Settings(BaseSettings):
     auth_csrf_cookie_name: str = "medical_ai_csrf"
     auth_csrf_header_name: str = "X-CSRF-Token"
     auth_enforcement_enabled: bool = False
+    auth_password_reset_minutes: int = Field(default=30, ge=5, le=1440)
+    auth_dev_expose_password_reset_token: bool = False
 
     rate_limit_enabled: bool = False
     redis_url: str = Field(default="", repr=False)
@@ -75,6 +77,8 @@ class Settings(BaseSettings):
                 raise ValueError("production forbids unscoped MCP tools")
             if not self.rate_limit_enabled:
                 raise ValueError("production requires RATE_LIMIT_ENABLED=true")
+            if self.auth_dev_expose_password_reset_token:
+                raise ValueError("production forbids exposing password reset tokens")
         if self.rate_limit_enabled:
             if not self.redis_url.strip():
                 raise ValueError("enabled rate limiting requires REDIS_URL")

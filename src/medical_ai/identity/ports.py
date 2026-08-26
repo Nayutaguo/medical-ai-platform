@@ -8,8 +8,10 @@ from typing import Protocol
 from medical_ai.authorization import AccessContext
 from medical_ai.identity.models import (
     ActiveSession,
+    AdministrationAuditPage,
     AdministrationMember,
     AdministrationPage,
+    AdministrationRole,
     BootstrapPlan,
     BootstrapResult,
     FacilityCatalogSyncResult,
@@ -17,6 +19,10 @@ from medical_ai.identity.models import (
     InvitationRegistrationPlan,
     MembershipGrant,
     NewSession,
+    PasswordChangePlan,
+    PasswordResetChallenge,
+    PasswordResetPlan,
+    PasswordResetTokenPlan,
     PersistedUserInvitation,
     RegistrationResult,
     UserInvitationPlan,
@@ -28,6 +34,9 @@ class IdentityRepositoryPort(Protocol):
     """Minimal durable operations needed by interactive authentication."""
 
     def find_user_by_normalized_email(self, normalized_email: str) -> UserCredential | None:
+        ...
+
+    def find_user_by_id(self, user_id: str) -> UserCredential | None:
         ...
 
     def list_active_memberships(self, user_id: str) -> list[MembershipGrant]:
@@ -49,6 +58,23 @@ class IdentityRepositoryPort(Protocol):
         ...
 
     def revoke_session(self, session_id: str, *, revoked_at: datetime) -> None:
+        ...
+
+    def change_password(self, plan: PasswordChangePlan) -> None:
+        ...
+
+    def create_password_reset_token(self, plan: PasswordResetTokenPlan) -> bool:
+        ...
+
+    def find_password_reset_challenge(
+        self,
+        *,
+        token_hash: bytes,
+        now: datetime,
+    ) -> PasswordResetChallenge | None:
+        ...
+
+    def consume_password_reset(self, plan: PasswordResetPlan) -> None:
         ...
 
 
@@ -112,6 +138,64 @@ class GovernanceAdministrationRepositoryPort(Protocol):
         cursor: str | None,
         limit: int,
     ) -> AdministrationPage:
+        ...
+
+    def list_administration_permissions(
+        self,
+        *,
+        cursor: str | None,
+        limit: int,
+    ) -> AdministrationPage:
+        ...
+
+    def create_administration_role(
+        self,
+        *,
+        context: AccessContext,
+        role_key: str,
+        name: str,
+        description: str | None,
+        permission_ids: tuple[str, ...],
+        request_id: str | None,
+        occurred_at: datetime,
+    ) -> AdministrationRole:
+        ...
+
+    def update_administration_role(
+        self,
+        *,
+        context: AccessContext,
+        role_id: str,
+        name: str,
+        description: str | None,
+        permission_ids: tuple[str, ...],
+        expected_version: int,
+        request_id: str | None,
+        occurred_at: datetime,
+    ) -> AdministrationRole:
+        ...
+
+    def delete_administration_role(
+        self,
+        *,
+        context: AccessContext,
+        role_id: str,
+        expected_version: int,
+        request_id: str | None,
+        occurred_at: datetime,
+    ) -> None:
+        ...
+
+    def list_administration_audit_events(
+        self,
+        context: AccessContext,
+        *,
+        cursor: str | None,
+        limit: int,
+        action: str | None,
+        outcome: str | None,
+        read_at: datetime,
+    ) -> AdministrationAuditPage:
         ...
 
     def replace_membership_roles(

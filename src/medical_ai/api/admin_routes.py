@@ -41,6 +41,74 @@ def list_roles():
     return success_response(page.to_public_dict())
 
 
+@admin_api.get("/permissions")
+def list_permissions():
+    _require_authentication_enabled()
+    context = access_context()
+    page = _service().list_permissions(
+        context,
+        cursor=_page_cursor(),
+        limit=_page_limit(),
+    )
+    return success_response(page.to_public_dict())
+
+
+@admin_api.post("/roles")
+def create_role():
+    _require_authentication_enabled()
+    context = access_context(require_csrf=True)
+    payload = _json_object()
+    _reject_unknown_fields(
+        payload,
+        {"role_key", "name", "description", "permission_ids"},
+    )
+    role = _service().create_role(
+        context,
+        role_key=_required_value(payload, "role_key"),
+        name=_required_value(payload, "name"),
+        description=payload.get("description"),
+        permission_ids=_required_value(payload, "permission_ids"),
+        request_id=current_request_id(),
+    )
+    return success_response(role.to_public_dict(), status=201)
+
+
+@admin_api.put("/roles/<role_id>")
+def update_role(role_id: str):
+    _require_authentication_enabled()
+    context = access_context(require_csrf=True)
+    payload = _json_object()
+    _reject_unknown_fields(
+        payload,
+        {"name", "description", "permission_ids", "expected_version"},
+    )
+    role = _service().update_role(
+        context,
+        role_id=role_id,
+        name=_required_value(payload, "name"),
+        description=payload.get("description"),
+        permission_ids=_required_value(payload, "permission_ids"),
+        expected_version=_required_value(payload, "expected_version"),
+        request_id=current_request_id(),
+    )
+    return success_response(role.to_public_dict())
+
+
+@admin_api.delete("/roles/<role_id>")
+def delete_role(role_id: str):
+    _require_authentication_enabled()
+    context = access_context(require_csrf=True)
+    payload = _json_object()
+    _reject_unknown_fields(payload, {"expected_version"})
+    _service().delete_role(
+        context,
+        role_id=role_id,
+        expected_version=_required_value(payload, "expected_version"),
+        request_id=current_request_id(),
+    )
+    return success_response({"deleted": True})
+
+
 @admin_api.get("/facilities")
 def list_facilities():
     _require_authentication_enabled()
@@ -49,6 +117,20 @@ def list_facilities():
         context,
         cursor=_page_cursor(),
         limit=_page_limit(),
+    )
+    return success_response(page.to_public_dict())
+
+
+@admin_api.get("/audit-events")
+def list_audit_events():
+    _require_authentication_enabled()
+    context = access_context()
+    page = _service().list_audit_events(
+        context,
+        cursor=request.args.get("cursor"),
+        limit=_page_limit(),
+        action=request.args.get("action"),
+        outcome=request.args.get("outcome"),
     )
     return success_response(page.to_public_dict())
 

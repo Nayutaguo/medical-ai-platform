@@ -31,17 +31,25 @@ from medical_ai.identity import (
     roles,
     users,
 )
-from medical_ai.identity.models import UserInvitationPlan
 from medical_ai.identity.errors import (
     AdministrationLastManagerError,
+    AdministrationRoleInUseError,
     AdministrationResourceNotFoundError,
     AdministrationScopeConflictError,
     AdministrationSelfLockoutError,
     AdministrationStatusConflictError,
+    AdministrationSystemRoleImmutableError,
     AdministrationVersionConflictError,
     AuthenticationRequiredError,
     FacilityCatalogScopeUnavailableError,
     FacilityOwnershipConflictError,
+    InvalidPasswordResetError,
+)
+from medical_ai.identity.models import (
+    PasswordChangePlan,
+    PasswordResetPlan,
+    PasswordResetTokenPlan,
+    UserInvitationPlan,
 )
 from medical_ai.repositories import IdentityRepository
 
@@ -1098,6 +1106,344 @@ def test_facility_catalog_sync_requires_explicit_dataset_tenant_binding(
                 audit_events.c.request_id == "sync-wrong-owner"
             )
         ).scalar_one() == 0
+
+
+def test_custom_role_changes_are_tenant_bound_versioned_and_audited(
+    identity_repository,
+) -> None:
+    repository, engine = identity_repository
+    context = _admin_context()
+
+    created = repository.create_administration_role(
+        context=context,
+        role_key="quality_analyst",
+        name="Quality analyst",
+        description="Aggregate quality analysis",
+        permission_ids=("permission-query",),
+        request_id="role-create",
+        occurred_at=NOW,
+    )
+    assert created.is_system is False
+    assert created.permissions == (PermissionCode.ANALYTICS_QUERY_EXECUTE.value,)
+
+    with engine.begin() as connection:
+        connection.execute(
+            membership_roles.insert().values(
+                organization_id="organization-1",
+                membership_id="membership-target",
+                role_id=created.id,
+            )
+        )
+    updated = repository.update_administration_role(
+        context=context,
+        role_id=created.id,
+        name="Quality reviewer",
+        description=None,
+        permission_ids=("permission-schema",),
+        expected_version=1,
+        request_id="role-update",
+        occurred_at=NOW,
+    )
+    assert updated.version == 2
+    assert updated.permissions == (PermissionCode.ANALYTICS_SCHEMA_READ.value,)
+    with engine.connect() as connection:
+        target_version = connection.execute(
+            select(
+                organization_memberships.c.authorization_version,
+                organization_memberships.c.version,
+            ).where(organization_memberships.c.id == "membership-target")
+        ).one()
+        actions = connection.execute(
+            select(audit_events.c.action)
+            .where(audit_events.c.request_id.in_(("role-create", "role-update")))
+            .order_by(audit_events.c.id)
+        ).scalars().all()
+    assert target_version == (2, 2)
+    assert actions == ["identity.role.create", "identity.role.update"]
+
+    with pytest.raises(AdministrationRoleInUseError):
+        repository.delete_administration_role(
+            context=context,
+            role_id=created.id,
+            expected_version=2,
+            request_id="role-delete-in-use",
+            occurred_at=NOW,
+        )
+    with engine.begin() as connection:
+        connection.execute(
+            membership_roles.delete().where(
+                membership_roles.c.membership_id == "membership-target",
+                membership_roles.c.role_id == created.id,
+            )
+        )
+    repository.delete_administration_role(
+        context=context,
+        role_id=created.id,
+        expected_version=2,
+        request_id="role-delete",
+        occurred_at=NOW,
+    )
+    with engine.connect() as connection:
+        assert connection.execute(
+            select(roles.c.id).where(roles.c.id == created.id)
+        ).scalar_one_or_none() is None
+        assert connection.execute(
+            select(audit_events.c.action).where(
+                audit_events.c.request_id == "role-delete"
+            )
+        ).scalar_one() == "identity.role.delete"
+
+
+def test_system_roles_and_unknown_permission_ids_fail_closed(
+    identity_repository,
+) -> None:
+    repository, engine = identity_repository
+    with engine.begin() as connection:
+        connection.execute(
+            roles.update().where(roles.c.id == "role-admin").values(is_system=True)
+        )
+
+    with pytest.raises(AdministrationSystemRoleImmutableError):
+        repository.update_administration_role(
+            context=_admin_context(),
+            role_id="role-admin",
+            name="Changed",
+            description=None,
+            permission_ids=("permission-query",),
+            expected_version=1,
+            request_id="system-role-update",
+            occurred_at=NOW,
+        )
+    with pytest.raises(AdministrationScopeConflictError):
+        repository.create_administration_role(
+            context=_admin_context(),
+            role_key="future_role",
+            name="Future role",
+            description=None,
+            permission_ids=("permission-future",),
+            request_id="future-permission",
+            occurred_at=NOW,
+        )
+    with engine.connect() as connection:
+        assert connection.execute(
+            select(func.count()).select_from(audit_events).where(
+                audit_events.c.request_id.in_(
+                    ("system-role-update", "future-permission")
+                )
+            )
+        ).scalar_one() == 0
+
+
+def test_audit_query_is_tenant_scoped_and_drops_historical_unknown_details(
+    identity_repository,
+) -> None:
+    repository, engine = identity_repository
+    with engine.begin() as connection:
+        connection.execute(
+            permissions.insert().values(
+                id="permission-audit-read",
+                permission_key=PermissionCode.AUDIT_READ.value,
+                resource="audit",
+                action="read",
+            )
+        )
+        connection.execute(
+            role_permissions.insert().values(
+                role_id="role-admin",
+                permission_id="permission-audit-read",
+            )
+        )
+        connection.execute(
+            audit_events.insert(),
+            [
+                {
+                    "organization_id": "organization-1",
+                    "actor_kind": "system",
+                    "action": "identity.safe",
+                    "resource_type": "role",
+                    "resource_id": "role-1",
+                    "outcome": "success",
+                    "error_code": None,
+                    "details": {"role_keys": ["analyst-primary"]},
+                },
+                {
+                    "organization_id": "organization-1",
+                    "actor_kind": "system",
+                    "action": "identity.legacy",
+                    "resource_type": "role",
+                    "resource_id": "role-2",
+                    "outcome": "failure",
+                    "error_code": "LEGACY_FAILURE",
+                    "details": {"sql": "SELECT secret"},
+                },
+                {
+                    "organization_id": "organization-2",
+                    "actor_kind": "system",
+                    "action": "identity.other",
+                    "resource_type": "role",
+                    "resource_id": "role-other-org",
+                    "outcome": "success",
+                    "error_code": None,
+                    "details": {},
+                },
+            ],
+        )
+
+    page = repository.list_administration_audit_events(
+        _admin_context(),
+        cursor=None,
+        limit=20,
+        action=None,
+        outcome=None,
+        read_at=NOW,
+    )
+    assert [event.action for event in page.items] == [
+        "identity.legacy",
+        "identity.safe",
+    ]
+    assert page.items[0].details == {}
+    assert page.items[1].details == {"role_keys": ["analyst-primary"]}
+    assert all(event.resource_id != "role-other-org" for event in page.items)
+
+    filtered = repository.list_administration_audit_events(
+        _admin_context(),
+        cursor=None,
+        limit=20,
+        action="identity.legacy",
+        outcome="failure",
+        read_at=NOW,
+    )
+    assert len(filtered.items) == 1
+    assert filtered.items[0].error_code == "LEGACY_FAILURE"
+
+
+def test_password_change_revokes_all_sessions_and_audits_without_secrets(
+    identity_repository,
+) -> None:
+    repository, engine = identity_repository
+    with engine.begin() as connection:
+        connection.execute(
+            users.update()
+            .where(users.c.id == "user-1")
+            .values(password_hash="old-verifier", password_algorithm="argon2id")
+        )
+    repository.change_password(
+        PasswordChangePlan(
+            context=_admin_context(),
+            expected_password_hash="old-verifier",
+            password_hash="new-verifier",
+            password_algorithm="argon2id",
+            changed_at=NOW,
+            request_id="password-change",
+        )
+    )
+    with engine.connect() as connection:
+        user = connection.execute(
+            select(
+                users.c.password_hash,
+                users.c.auth_version,
+            ).where(users.c.id == "user-1")
+        ).one()
+        active_sessions = connection.execute(
+            select(func.count()).select_from(auth_sessions).where(
+                auth_sessions.c.user_id == "user-1",
+                auth_sessions.c.revoked_at.is_(None),
+            )
+        ).scalar_one()
+        audit = connection.execute(
+            select(audit_events.c.details).where(
+                audit_events.c.request_id == "password-change"
+            )
+        ).scalar_one()
+    assert user == ("new-verifier", 2)
+    assert active_sessions == 0
+    assert audit == {}
+
+
+def test_password_reset_token_is_single_use_and_identity_version_bound(
+    identity_repository,
+) -> None:
+    repository, engine = identity_repository
+    with engine.begin() as connection:
+        connection.execute(
+            users.update()
+            .where(users.c.id == "user-target")
+            .values(password_hash="old-verifier", password_algorithm="argon2id")
+        )
+    token_hash = b"r" * 32
+    assert repository.create_password_reset_token(
+        PasswordResetTokenPlan(
+            token_id="password-reset-token",
+            token_hash=token_hash,
+            user_id="user-target",
+            organization_id="organization-1",
+            membership_id="membership-target",
+            identity_version=1,
+            expires_at=NOW + timedelta(minutes=30),
+            created_at=NOW,
+            request_id="password-reset-request",
+        )
+    ) is True
+    challenge = repository.find_password_reset_challenge(
+        token_hash=token_hash,
+        now=NOW,
+    )
+    assert challenge is not None
+    repository.consume_password_reset(
+        PasswordResetPlan(
+            token_hash=token_hash,
+            password_hash="new-verifier",
+            password_algorithm="argon2id",
+            expected_user_id=challenge.user_id,
+            expected_organization_id=challenge.organization_id,
+            expected_membership_id=challenge.membership_id,
+            expected_identity_version=challenge.identity_version,
+            expected_user_version=challenge.user_version,
+            expected_token_version=challenge.token_version,
+            completed_at=NOW,
+            request_id="password-reset-complete",
+        )
+    )
+    assert repository.find_password_reset_challenge(
+        token_hash=token_hash,
+        now=NOW,
+    ) is None
+    with pytest.raises(InvalidPasswordResetError):
+        repository.consume_password_reset(
+            PasswordResetPlan(
+                token_hash=token_hash,
+                password_hash="another-verifier",
+                password_algorithm="argon2id",
+                expected_user_id=challenge.user_id,
+                expected_organization_id=challenge.organization_id,
+                expected_membership_id=challenge.membership_id,
+                expected_identity_version=challenge.identity_version,
+                expected_user_version=challenge.user_version,
+                expected_token_version=challenge.token_version,
+                completed_at=NOW,
+                request_id="password-reset-reuse",
+            )
+        )
+    with engine.connect() as connection:
+        user = connection.execute(
+            select(users.c.password_hash, users.c.auth_version).where(
+                users.c.id == "user-target"
+            )
+        ).one()
+        actions = connection.execute(
+            select(audit_events.c.action)
+            .where(
+                audit_events.c.request_id.in_(
+                    ("password-reset-request", "password-reset-complete")
+                )
+            )
+            .order_by(audit_events.c.id)
+        ).scalars().all()
+    assert user == ("new-verifier", 2)
+    assert actions == [
+        "identity.password.reset.request",
+        "identity.password.reset.complete",
+    ]
 
 
 def _seed_identity_data(engine) -> None:
