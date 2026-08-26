@@ -60,7 +60,12 @@ analytics access.
 | --- | --- | --- |
 | `GET /members` | `users.manage` **or** `roles.assign` | no |
 | `GET /roles` | `roles.assign` | no |
+| `GET /permissions` | `roles.assign` | no |
+| `POST /roles` | `roles.assign` | yes |
+| `PUT /roles/{role_id}` | `roles.assign` | yes |
+| `DELETE /roles/{role_id}` | `roles.assign` | yes |
 | `GET /facilities` | `roles.assign` **or** `imports.create` | no |
+| `GET /audit-events` | `audit.read` | no |
 | `POST /invitations` | `users.manage` | yes |
 | `PUT /members/{membership_id}/roles` | `roles.assign` | yes |
 | `PUT /members/{membership_id}/facility-scope` | `roles.assign` | yes |
@@ -92,7 +97,8 @@ member invalidate all of that member's old-version sessions.
 
 ## Pagination
 
-The three catalog endpoints use bounded keyset pagination:
+Member, role, permission, and facility catalogs use bounded ascending keyset
+pagination:
 
 ```text
 ?cursor=<last-returned-id>&limit=50
@@ -101,8 +107,12 @@ The three catalog endpoints use bounded keyset pagination:
 - `limit` defaults to 50 and must be between 1 and 100.
 - `cursor` is optional, non-empty, and at most 36 characters.
 - `data.next_cursor` is `null` when the page is complete.
-- Members are ordered by `membership_id`; roles and facilities are ordered by
-  their `id`.
+- Members are ordered by `membership_id`; roles, facilities, and permissions
+  are ordered by their `id`.
+
+Audit events use a descending numeric `id` cursor with the same default and
+maximum limit. Its optional exact-match filters are `action` and `outcome`,
+where outcome is `success`, `denied`, or `failure`.
 
 ## List organization members
 
@@ -137,6 +147,7 @@ current roles and explicit facility grants.
               "analytics.query.execute",
               "analytics.schema.read"
             ],
+            "is_system": true,
             "version": 1
           }
         ],
@@ -189,6 +200,7 @@ Returns only roles owned by the active organization.
         "analytics.query.execute",
         "analytics.schema.read"
       ],
+      "is_system": true,
       "version": 1
     }
   ],
@@ -196,8 +208,132 @@ Returns only roles owned by the active organization.
 }
 ```
 
-This slice lists and assigns existing roles. It does not create, rename, delete,
-or edit role permission definitions.
+`is_system=true` marks deployment-owned roles such as the bootstrap roles; they
+may be assigned but cannot be edited or deleted by a tenant administrator.
+
+## List the permission catalog
+
+`GET /api/v1/admin/permissions`
+
+Returns only permission codes known to the current application build. The
+permission record IDs, rather than permission-code strings, are used when
+creating or editing roles.
+
+```json
+{
+  "items": [
+    {
+      "id": "permission-uuid",
+      "permission_key": "analytics.query.execute",
+      "resource": "analytics.query",
+      "action": "execute",
+      "description": "Run governed aggregate queries",
+      "version": 1
+    }
+  ],
+  "next_cursor": null
+}
+```
+
+## Create a custom role
+
+`POST /api/v1/admin/roles`
+
+```json
+{
+  "role_key": "quality_analyst",
+  "name": "Quality Analyst",
+  "description": "Runs approved aggregate quality analyses",
+  "permission_ids": ["permission-uuid"]
+}
+```
+
+`role_key` is normalized to lowercase and accepts a leading lowercase letter
+followed by at most 99 lowercase letters, digits, `_`, or `-`. `name` is 1 to
+120 characters, the optional description is at most 2,000 characters, and
+permission IDs must be unique, application-known records. Success is HTTP 201
+and returns the complete role with `is_system=false` and `version=1`.
+
+Role creation and its sanitized `identity.role.create` audit event share one
+transaction. Duplicate keys return `ADMIN_ROLE_KEY_CONFLICT`.
+
+## Update a custom role
+
+`PUT /api/v1/admin/roles/{role_id}`
+
+```json
+{
+  "name": "Quality Review Analyst",
+  "description": "Updated description",
+  "permission_ids": ["permission-uuid"],
+  "expected_version": 1
+}
+```
+
+This replaces the role name, description, and entire permission set; the role
+key is immutable. A permission change increments the authorization and object
+versions of affected memberships, invalidating their older sessions. The
+repository prevents both caller self-lockout and removal of the organization's
+final full management path. Built-in roles return
+`ADMIN_SYSTEM_ROLE_IMMUTABLE`; stale versions return
+`ADMIN_VERSION_CONFLICT`.
+
+## Delete a custom role
+
+`DELETE /api/v1/admin/roles/{role_id}`
+
+The JSON body and CSRF proof are required:
+
+```json
+{"expected_version": 2}
+```
+
+Success returns `{"deleted": true}` and appends the deletion audit fact in the
+same transaction. A system role cannot be deleted. A role still assigned to any
+membership returns `ADMIN_ROLE_IN_USE`; remove its assignments first.
+
+## Query redacted audit events
+
+`GET /api/v1/admin/audit-events`
+
+Example:
+
+```text
+GET /api/v1/admin/audit-events?limit=20&action=identity.role.update&outcome=success
+```
+
+```json
+{
+  "items": [
+    {
+      "id": 42,
+      "occurred_at": "2026-08-26T09:00:00",
+      "request_id": "request-id",
+      "actor_kind": "user",
+      "actor_user_id": "user-uuid",
+      "action": "identity.role.update",
+      "resource_type": "role",
+      "resource_id": "role-uuid",
+      "outcome": "success",
+      "error_code": null,
+      "details": {"role_keys": ["quality_analyst"]}
+    }
+  ],
+  "next_cursor": null
+}
+```
+
+The query is bound to the caller's current organization and returns a redacted
+projection only. It omits membership actors, token/verifier values, facility
+grant IDs, SQL, and infrastructure-only columns. `details` is sourced from the
+sanitized ledger, not arbitrary request bodies. The browser **审计日志** page
+supports action/outcome filtering and cursor paging.
+
+Audit-event *reading* is complete for the current ledger, but event *writing*
+coverage is still partial. Successful role/password and existing management
+mutations are recorded; login/logout, all denial/failure paths, analytics,
+Agent, local export, import, and cross-service lifecycle events are not yet a
+complete production audit chain.
 
 ## List organization facilities
 
@@ -340,6 +476,7 @@ versions and current roles/facilities. For example:
         "analytics.query.execute",
         "analytics.schema.read"
       ],
+      "is_system": true,
       "version": 1
     }
   ],
@@ -456,9 +593,10 @@ membership IDs return the same not-found response as unknown IDs. Role and
 facility selections outside the active organization return a scope conflict
 without revealing the other tenant's state.
 
-Successful invitation issuance, role replacement, facility-scope replacement,
-membership-status changes, and facility synchronization append sanitized audit
-facts in the same MySQL transaction as their control-plane mutation. Complete
+Successful invitation issuance, role-definition changes, role replacement,
+facility-scope replacement, membership-status changes, facility
+synchronization, and password lifecycle changes append sanitized audit facts in
+the same MySQL transaction as their control-plane mutation. Complete
 attempt/failure audit coverage and a transactional outbox remain release work.
 
 ## Stable errors
@@ -473,6 +611,9 @@ attempt/failure audit coverage and a transactional outbox remain release work.
 | 404 | `ADMIN_RESOURCE_NOT_FOUND` | Object is absent or outside the active organization |
 | 409 | `INVITATION_CONFLICT` | Invitation cannot be created for the requested identity state |
 | 409 | `ADMIN_VERSION_CONFLICT` | `expected_version` is stale |
+| 409 | `ADMIN_ROLE_KEY_CONFLICT` | The tenant already owns the requested role key |
+| 409 | `ADMIN_SYSTEM_ROLE_IMMUTABLE` | A built-in role cannot be edited or deleted |
+| 409 | `ADMIN_ROLE_IN_USE` | A role must be unassigned before deletion |
 | 409 | `ADMIN_SCOPE_CONFLICT` | Selected role or facility is outside the active tenant/scope |
 | 409 | `ADMIN_SELF_LOCKOUT` | Mutation would remove the caller's active management path |
 | 409 | `ADMIN_LAST_MANAGER` | Mutation would remove or suspend the organization's final active full manager |
@@ -495,6 +636,8 @@ The current workspace supports:
 - paged member, role, and facility catalogs;
 - one-time invitation issuance without local/session-storage persistence;
 - role and facility-scope replacement using the returned optimistic version;
+- custom-role creation, editing, permission replacement, and unused-role deletion;
+- redacted audit-event browsing for users with `audit.read`;
 - member suspension and reactivation;
 - explicit facility-catalog synchronization.
 
@@ -506,8 +649,8 @@ narrow or refresh rather than issuing an unbounded request.
 This management slice is not a production deployment. The following remain:
 
 - privileged-account MFA or step-up authentication;
-- password reset and broader account-recovery/lifecycle policy;
-- role-definition creation/editing and an audit-ledger read API/UI;
+- production password-reset delivery and broader account-recovery/lifecycle
+  policy;
 - production TLS/proxy, secrets, least-privilege database identities,
   monitoring, backup/restore drills, and authenticated browser E2E acceptance;
 - complete attempt/failure audit and durable outbox integration;

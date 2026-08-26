@@ -131,9 +131,9 @@ conda run -n medical-ai python scripts/demo_query_mysql.py data/sample/queryspec
 
 ## Control-plane database migration
 
-Identity, authorization, session, audit, and background-job tables are managed
-through Alembic. The migration reads the existing `MYSQL_*` environment values;
-credentials are never stored in `alembic.ini`.
+Identity, authorization, session, audit, analysis-history, and background-job
+tables are managed through Alembic. The migration reads the existing `MYSQL_*`
+environment values; credentials are never stored in `alembic.ini`.
 
 ```bash
 conda run -n medical-ai alembic upgrade head
@@ -145,10 +145,17 @@ dropped by the control-plane migration. The reviewed rollback is available as
 `alembic downgrade 001_existing_analytics_baseline`; it destroys control-plane
 data and must not be run as a routine operation.
 
+Migration `007_demo_completion` adds membership-scoped `analysis_history` and
+widens the one-time-token purpose for password reset. It deliberately stores no
+query result rows, compiled SQL, or original Agent question. Apply it with
+`alembic upgrade head` before using history or password recovery.
+
 The browser-session and invited-registration contract is documented in
 [`docs/API_AUTH.md`](docs/API_AUTH.md). Tenant administration endpoints,
 permissions, optimistic versions, and facility-scope rules are documented in
-[`docs/API_ADMIN.md`](docs/API_ADMIN.md).
+[`docs/API_ADMIN.md`](docs/API_ADMIN.md). History, favorites, and the explicitly
+local export boundary are documented in
+[`docs/API_HISTORY_EXPORTS.md`](docs/API_HISTORY_EXPORTS.md).
 
 Create the first organization administrator once, after migration. The password
 is prompted securely and there is no shipped default credential:
@@ -207,10 +214,10 @@ Optional MySQL integration tests:
 RUN_MYSQL_TESTS=1 pytest tests/integration
 ```
 
-Current verified baseline: 428 tests pass, the normal suite skips nine
-external integrations, and all nine MySQL integrations pass when explicitly
-enabled. The frontend has 12 Vitest/Testing Library checks and also passes
-`tsc --noEmit` and `npm run build`.
+Current completion-slice verification: the normal Python suite is **463 passed,
+9 external integrations skipped**; the opt-in MySQL suite is **9 passed**;
+Alembic is at `007_demo_completion` with no detected drift; and the frontend is
+**27 tests passed** plus successful `tsc --noEmit` and `npm run build`.
 
 ## Minimal Demo
 
@@ -278,7 +285,11 @@ conda run -n medical-ai python scripts/demo_mcp_http_client.py --url http://127.
 
 ## Web Application
 
-The web frontend uses React + Vite + MUI + ECharts, following the workbench pattern from the MIT-licensed Data Formulator project. It shows schema, distinct values, Agent intent, QuerySpec, execution metadata, result table, chart, and written insight.
+The web frontend uses React + Vite + MUI + ECharts, following the workbench
+pattern from the MIT-licensed Data Formulator project. It preserves the existing
+three-column analysis layout and adds login/registration, password lifecycle,
+history/favorites, local CSV/PNG/HTML export, custom-role management, and an
+organization audit-query page.
 
 Start backend API:
 
@@ -335,9 +346,17 @@ Versioned endpoints:
 - `POST /api/v1/auth/sessions`
 - `GET /api/v1/auth/me`
 - `DELETE /api/v1/auth/sessions/current`
+- `POST /api/v1/auth/password/change`
+- `POST /api/v1/auth/password-reset-requests`
+- `POST /api/v1/auth/password-resets`
 - `GET /api/v1/admin/members`
 - `GET /api/v1/admin/roles`
+- `GET /api/v1/admin/permissions`
+- `POST /api/v1/admin/roles`
+- `PUT /api/v1/admin/roles/{role_id}`
+- `DELETE /api/v1/admin/roles/{role_id}`
 - `GET /api/v1/admin/facilities`
+- `GET /api/v1/admin/audit-events`
 - `POST /api/v1/admin/invitations`
 - `PUT /api/v1/admin/members/{membership_id}/roles`
 - `PUT /api/v1/admin/members/{membership_id}/facility-scope`
@@ -347,16 +366,27 @@ Versioned endpoints:
 - `GET /api/v1/distinct`
 - `POST /api/v1/query`
 - `POST /api/v1/ask`
+- `GET /api/v1/history`
+- `PATCH /api/v1/history/{history_id}/favorite`
+- `DELETE /api/v1/history/{history_id}`
 
 Every response uses the stable `success/data/meta/error` envelope and returns an
 `X-Request-Id` header. Governed analytics require exact permissions, a non-empty
 trusted facility scope, approved field capabilities, and groups at or above the
 privacy threshold. See `docs/API_AUTH.md` and ADR 0003.
-Administration is tenant-bound, requires exact `users.manage`, `roles.assign`,
-or `imports.create` permissions by operation, and requires CSRF plus
-`expected_version` on membership writes. See `docs/API_ADMIN.md`.
-This is still a pre-production slice: privileged MFA/step-up, password reset,
-authenticated browser acceptance, and the production deployment chain remain.
+Administration is tenant-bound, uses exact permissions per operation, and
+requires CSRF plus optimistic versions on writes. Password reset tokens are
+single-use and identity-version-bound; production still needs an approved
+email/SMS delivery adapter, while an explicit development flag may reveal a
+new token once for loopback demonstration. See `docs/API_AUTH.md` and
+`docs/API_ADMIN.md`.
+
+CSV, chart PNG, and HTML report downloads are generated entirely in the browser
+from the already authorized aggregate response. They are a convenient training
+demonstration, not a server-authorized/audited export workflow. Audit reads are
+implemented for the sanitized ledger, but event coverage is still partial.
+Privileged MFA/step-up, complete audit/outbox coverage, authenticated browser
+acceptance, and the production deployment chain remain release work.
 
 Start frontend:
 
