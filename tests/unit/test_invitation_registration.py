@@ -972,5 +972,5 @@ def test_one_time_token_schema_has_complete_tenant_and_identity_binding() -> Non
         "organization_memberships.organization_id",
     ) in composite_targets
     check_sql = {str(constraint.sqltext) for constraint in one_time_tokens.constraints if hasattr(constraint, "sqltext")}
-    assert "purpose = 'user_invitation'" in check_sql
+    assert "purpose IN ('user_invitation', 'password_reset')" in check_sql
     assert "identity_version >= 1" in check_sql

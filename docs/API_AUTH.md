@@ -216,6 +216,132 @@ Stable errors:
 - `403 CSRF_VALIDATION_FAILED`.
 - `503 DATABASE_UNAVAILABLE`.
 
+## Change the current password
+
+`POST /api/v1/auth/password/change`
+
+Requires the current opaque session and CSRF proof. The password policy is the
+same Argon2id-backed policy used by registration (currently at least 12
+characters and at most 1,024 UTF-8 bytes).
+
+```json
+{
+  "current_password": "current user-supplied password",
+  "new_password": "replacement user-supplied password"
+}
+```
+
+Success is HTTP 200:
+
+```json
+{
+  "success": true,
+  "data": {"changed": true},
+  "meta": {"request_id": "request-id"},
+  "error": null
+}
+```
+
+The verifier replacement, identity-version increment, revocation of every
+session for the identity, and sanitized success audit event are committed in
+one transaction. The response expires both browser cookies; the user must log
+in again. Password values are never returned or logged.
+
+Stable errors include:
+
+- `400 CURRENT_PASSWORD_INVALID`: the current verifier is wrong; the response
+  does not reveal credential metadata.
+- `400 PASSWORD_POLICY_VIOLATION`: the new password violates policy.
+- `401 AUTHENTICATION_REQUIRED`: the session is absent, expired, revoked, or
+  became stale during the write.
+- `403 CSRF_VALIDATION_FAILED`.
+- `503 DATABASE_UNAVAILABLE`.
+
+## Request a password reset
+
+`POST /api/v1/auth/password-reset-requests`
+
+This endpoint is intentionally unauthenticated and uses the same Redis
+source/account limiter as login. `organization_id` is optional; when it is
+present the token is bound to that active membership. An omitted organization
+uses one deterministic active membership and the eventual delivery channel
+must preserve the bound organization in the reset link.
+
+```json
+{
+  "email": "analyst@example.com",
+  "organization_id": "optional-organization-uuid"
+}
+```
+
+Known, unknown, disabled, malformed-account-state, and unavailable-membership
+lookups all receive the same HTTP 202 acceptance shape:
+
+```json
+{
+  "success": true,
+  "data": {"accepted": true},
+  "meta": {"request_id": "request-id"},
+  "error": null
+}
+```
+
+For an eligible identity, issuing a new token invalidates its previous unused
+password-reset tokens. MySQL persists only the token digest, purpose,
+organization/membership/user binding, identity version, and expiry. The default
+lifetime is 30 minutes and can be configured from 5 to 1,440 minutes with
+`AUTH_PASSWORD_RESET_MINUTES`.
+
+The current repository does **not** include a production email/SMS delivery
+adapter. Therefore the production request endpoint is enumeration-safe but the
+end-to-end recovery flow is not deployable until an approved channel delivers
+the raw token and bound organization. For explicit loopback demonstrations,
+setting `AUTH_DEV_EXPOSE_PASSWORD_RESET_TOKEN=true` adds these fields once:
+
+```json
+{
+  "accepted": true,
+  "reset_token": "single-use-secret",
+  "expires_at": "2026-08-26T08:30:00Z",
+  "organization_id": "organization-uuid"
+}
+```
+
+Production configuration validation rejects that development flag. Never put a
+reset token in Git, logs, analytics, browser storage, screenshots, or tickets.
+
+Stable errors include:
+
+- `400 INVALID_REQUEST`: malformed or oversized request fields.
+- `429 LOGIN_RATE_LIMITED` with `Retry-After`.
+- `503 LOGIN_RATE_LIMIT_UNAVAILABLE`: enabled Redis protection cannot decide.
+- `503 DATABASE_UNAVAILABLE`.
+
+## Complete a password reset
+
+`POST /api/v1/auth/password-resets`
+
+```json
+{
+  "token": "single-use-secret",
+  "email": "analyst@example.com",
+  "organization_id": "token-bound-organization-uuid",
+  "new_password": "replacement user-supplied password"
+}
+```
+
+The password policy is evaluated before token lookup. The token must be unused,
+unexpired, and bound to the supplied normalized email, organization,
+membership, purpose, and current identity version. Successful consumption,
+verifier replacement, identity-version increment, revocation of every session,
+and the sanitized audit event are atomic.
+
+Success is HTTP 200 with `{"reset": true}`. Wrong, expired, used, cross-email,
+cross-organization, and version-stale credentials all return the same
+`400 PASSWORD_RESET_INVALID` response. Other stable errors are
+`PASSWORD_POLICY_VIOLATION`, `LOGIN_RATE_LIMITED`,
+`LOGIN_RATE_LIMIT_UNAVAILABLE`, and `DATABASE_UNAVAILABLE`.
+
 ## Governed analytics permissions
 
 When `AUTH_ENFORCEMENT_ENABLED=true`, the following endpoints resolve the active
@@ -269,8 +395,11 @@ MCP_ALLOW_UNSCOPED_TOOLS=false
 RATE_LIMIT_ENABLED=true
 REDIS_URL=rediss://...
 RATE_LIMIT_KEY_SECRET=<at least 32 random UTF-8 bytes>
+AUTH_PASSWORD_RESET_MINUTES=30
+AUTH_DEV_EXPOSE_PASSWORD_RESET_TOKEN=false
 ```
 
 Production still requires TLS termination, trusted proxy configuration,
-least-privilege database accounts, MFA for privileged users, audit integration,
-monitoring, and recovery testing before release.
+least-privilege database accounts, MFA for privileged users, complete audit
+integration, a reviewed password-reset delivery channel, monitoring, and
+recovery testing before release.

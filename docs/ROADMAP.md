@@ -34,6 +34,9 @@ Goal: run a safe, testable data-query chain.
 - Completed: stable `success/data/meta/error` contract, request IDs, size limits, and exception mapping.
 - Completed: aggregate-only public QuerySpec endpoint and LLM-not-configured degradation.
 - Completed: existing React + Vite + MUI + ECharts workbench migrated through a minimal API-client change.
+- Completed training slice: membership-scoped history/favorites/QuerySpec reuse
+  and browser-local CSV, chart PNG, and HTML report generation. Local exports
+  are not the production server-authorized/audited export design.
 - Add deployment configuration around the Gunicorn WSGI entry point.
 - Identity, authorization, audit, and privacy work is tracked as the dedicated Phase 2.5 product release gate.
 
@@ -44,8 +47,9 @@ Goal: turn the analytical workbench into an authenticated, tenant-aware, auditab
 ### Identity and persistence foundation
 
 - Completed: Alembic baseline plus additive migrations through
-  `006_invitation_registration`, including facilities, cross-tenant integrity,
-  and tenant-bound one-time invitations.
+  `007_demo_completion`, including facilities, cross-tenant integrity,
+  tenant-bound one-time invitations, membership-scoped analysis history, and
+  the password-reset token purpose.
 - Separate the logical control and analytics schemas and use least-privilege credentials for application control writes, analytics reads, audit appends, and ingestion.
 - Completed foundation: organizations, users, memberships, roles, permissions,
   grants, facilities, scopes, sessions, tenant-bound invitation tokens, audit
@@ -56,9 +60,10 @@ Goal: turn the analytical workbench into an authenticated, tenant-aware, auditab
 ### Authentication and authorization
 
 - Completed: Argon2id, opaque server-side sessions, secure-cookie posture, CSRF,
-  frontend login/invited-registration/session/logout, and Redis source/account
-  authentication throttling. Password reset, broader account lifecycle policy,
-  and privileged MFA remain.
+  frontend login/invited-registration/session/logout/change-password/reset,
+  identity-version-bound single-use reset tokens, and Redis source/account
+  authentication throttling. Production email/SMS reset delivery, broader
+  account lifecycle policy, and privileged MFA remain.
 - Completed: authenticated immutable `AccessContext` with user, organization,
   membership, permissions, versions, and fail-closed facility scope.
 - Completed for analytics services: stable exact permission codes; frontend
@@ -70,6 +75,10 @@ Goal: turn the analytical workbench into an authenticated, tenant-aware, auditab
   membership lifecycle updates; and facility-catalog synchronization. Writes
   require CSRF and exact `users.manage`, `roles.assign`, or `imports.create`
   permissions by operation.
+- Completed custom-role slice: stable permission catalog plus tenant role
+  creation, full permission replacement, optimistic editing, and deletion of
+  unused roles. System roles are immutable and affected authorization versions
+  are invalidated.
 - Require explicit, time-bounded, and fully audited emergency access instead of granting medical-data access implicitly to platform administrators.
 
 ### Privacy, audit, and transport parity
@@ -82,6 +91,9 @@ Goal: turn the analytical workbench into an authenticated, tenant-aware, auditab
 - Completed for successful administration mutations: the audit fact shares the
   control-plane transaction. Attempt/failure coverage, other request paths, and
   transaction/outbox integration remain.
+- Completed audit-read slice: `audit.read` exposes a redacted, tenant-bound,
+  filterable keyset page and the frontend provides its query screen. Ledger
+  population remains partial; this does not imply complete audit coverage.
 - Completed: authenticated product analytics routes and non-sensitive health.
 - Completed fail-closed product posture: unscoped MCP is disabled. An
   authenticated MCP principal adapter remains.
@@ -90,14 +102,22 @@ Goal: turn the analytical workbench into an authenticated, tenant-aware, auditab
 
 - Completed first UI slices: existing workbench; login, invitation-only
   registration, permission-pending state, session restore, current organization,
-  and logout; plus a permission-aware organization management workspace for
-  invitations, member status, roles, facility scopes, and catalog sync.
+  logout, password change, forgot/reset password; plus a permission-aware
+  organization management workspace for invitations, member status, role
+  assignment/definition, facility scopes, catalog sync, and audit browsing.
+- Completed training history/export slice: successful authenticated QuerySpec
+  and Agent runs persist safe metadata without result rows or original Agent
+  questions; users can favorite/delete/reuse entries and locally download the
+  currently displayed authorized aggregate as CSV/PNG/HTML.
 - Administration still needs real-MySQL mutation coverage, authenticated browser
-  E2E, role-definition operations, complete audit/outbox behavior, and an
-  operational runbook before release.
+  E2E, complete audit/outbox behavior, and an operational runbook before
+  release.
 - Completed first Redis slice: production login throttling. Query/Agent limits,
   session/authorization caches, and invalidation remain.
-- Move long-running Agent, import, quality, export, and report work to durable background jobs; expose bounded status polling and cancellation APIs.
+- Move long-running Agent, import, quality, and production export/report work to
+  durable background jobs; expose bounded status polling and cancellation APIs.
+  The current browser-local export remains explicitly outside that production
+  workflow.
 - Connect the verified full-data importer to `background_jobs` and
   `dataset_versions`, including heartbeat, resume/checkpoint, idempotent
   activation, cancellation, and recovery drills. The local CLI is complete for

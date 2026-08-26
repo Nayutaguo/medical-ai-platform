@@ -10,10 +10,13 @@ from medical_ai.authorization import AccessContext, PermissionCode
 from medical_ai.config import Settings
 from medical_ai.identity.errors import (
     AdministrationLastManagerError,
+    AdministrationRoleInUseError,
+    AdministrationRoleKeyConflictError,
     AdministrationResourceNotFoundError,
     AdministrationScopeConflictError,
     AdministrationSelfLockoutError,
     AdministrationStatusConflictError,
+    AdministrationSystemRoleImmutableError,
     AdministrationVersionConflictError,
     AuthenticationRequiredError,
     CsrfValidationError,
@@ -232,6 +235,7 @@ def test_admin_catalog_requires_authentication_and_uses_bounded_page_contract() 
                 "name": "Analyst",
                 "description": "Read-only analyst",
                 "permissions": ["analytics.query.execute"],
+                "is_system": False,
                 "version": 1,
             }
         ],
@@ -263,6 +267,7 @@ def test_role_and_facility_catalogs_share_the_list_envelope() -> None:
                 "name": "Analyst",
                 "description": "Read-only analyst",
                 "permissions": ["analytics.query.execute"],
+                "is_system": False,
                 "version": 1,
             }
         ],
@@ -358,6 +363,7 @@ def test_admin_write_routes_preserve_contract_and_request_id() -> None:
                     "name": "Analyst",
                     "description": "Read-only analyst",
                     "permissions": ["analytics.query.execute"],
+                    "is_system": False,
                     "version": 1,
                 }
             ],
@@ -406,6 +412,9 @@ def test_optimistic_conflict_maps_to_stable_409_without_leaking_state() -> None:
         (AdministrationSelfLockoutError(), 409, "ADMIN_SELF_LOCKOUT"),
         (AdministrationLastManagerError(), 409, "ADMIN_LAST_MANAGER"),
         (AdministrationStatusConflictError(), 409, "ADMIN_STATUS_CONFLICT"),
+        (AdministrationRoleKeyConflictError(), 409, "ADMIN_ROLE_KEY_CONFLICT"),
+        (AdministrationSystemRoleImmutableError(), 409, "ADMIN_SYSTEM_ROLE_IMMUTABLE"),
+        (AdministrationRoleInUseError(), 409, "ADMIN_ROLE_IN_USE"),
         (FacilityOwnershipConflictError(), 409, "FACILITY_OWNERSHIP_CONFLICT"),
         (FacilityCatalogInvalidError(), 409, "FACILITY_CATALOG_INVALID"),
     ],

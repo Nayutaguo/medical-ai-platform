@@ -1,10 +1,13 @@
 import type {
+  AnalysisHistoryItem,
   AskPayload,
+  AdminPermission,
   AdminFacility,
   AdminListPayload,
   AdminMember,
   AdminRole,
   AuthSession,
+  AuditEvent,
   CurrentSessionPayload,
   DistinctPayload,
   FacilitySyncPayload,
@@ -12,6 +15,9 @@ import type {
   LoginCredentials,
   LoginPayload,
   LogoutPayload,
+  PasswordChangePayload,
+  PasswordResetPayload,
+  PasswordResetRequestPayload,
   QueryResult,
   RegistrationCredentials,
   RegistrationPayload,
@@ -170,6 +176,14 @@ export function isAuthenticationDisabled(error: unknown): boolean {
   );
 }
 
+/** Treat a rejected session and a lost CSRF proof as the same local auth boundary. */
+export function isAuthenticationLost(error: unknown): boolean {
+  return (
+    error instanceof ApiError &&
+    (error.status === 401 || error.code === 'CSRF_TOKEN_MISSING')
+  );
+}
+
 export function login(credentials: LoginCredentials): Promise<AuthSession> {
   const organizationId = credentials.organization_id?.trim();
   return requestJson<LoginPayload>(`${API_PREFIX}/auth/sessions`, {
@@ -237,6 +251,50 @@ export function logout(): Promise<void> {
   });
 }
 
+export function changePassword(currentPassword: string, newPassword: string): Promise<void> {
+  return requestJson<PasswordChangePayload>(
+    `${API_PREFIX}/auth/password/change`,
+    {
+      method: 'POST',
+      body: JSON.stringify({ current_password: currentPassword, new_password: newPassword }),
+    },
+    true,
+  ).then(() => {
+    csrfToken = null;
+  });
+}
+
+export function requestPasswordReset(
+  email: string,
+  organizationId?: string,
+): Promise<PasswordResetRequestPayload> {
+  const normalizedOrganization = organizationId?.trim();
+  return requestJson<PasswordResetRequestPayload>(`${API_PREFIX}/auth/password-reset-requests`, {
+    method: 'POST',
+    body: JSON.stringify({
+      email: email.trim(),
+      ...(normalizedOrganization ? { organization_id: normalizedOrganization } : {}),
+    }),
+  });
+}
+
+export function resetPassword(
+  token: string,
+  email: string,
+  organizationId: string,
+  newPassword: string,
+): Promise<PasswordResetPayload> {
+  return requestJson<PasswordResetPayload>(`${API_PREFIX}/auth/password-resets`, {
+    method: 'POST',
+    body: JSON.stringify({
+      token: token.trim(),
+      email: email.trim(),
+      organization_id: organizationId.trim(),
+      new_password: newPassword,
+    }),
+  });
+}
+
 function readCookie(name: string): string | null {
   if (typeof document === 'undefined') {
     return null;
@@ -298,6 +356,46 @@ export function listAdminMembers(cursor?: string): Promise<AdminListPayload<Admi
 export function listAdminRoles(cursor?: string): Promise<AdminListPayload<AdminRole>> {
   const query = cursor ? `?cursor=${encodeURIComponent(cursor)}` : '';
   return requestJson<AdminListPayload<AdminRole>>(`${API_PREFIX}/admin/roles${query}`);
+}
+
+export function listAdminPermissions(cursor?: string): Promise<AdminListPayload<AdminPermission>> {
+  const query = cursor ? `?cursor=${encodeURIComponent(cursor)}` : '';
+  return requestJson<AdminListPayload<AdminPermission>>(`${API_PREFIX}/admin/permissions${query}`);
+}
+
+export function createAdminRole(input: {
+  role_key: string;
+  name: string;
+  description: string;
+  permission_ids: string[];
+}): Promise<AdminRole> {
+  return requestJson<AdminRole>(
+    `${API_PREFIX}/admin/roles`,
+    { method: 'POST', body: JSON.stringify(input) },
+    true,
+  );
+}
+
+export function updateAdminRole(
+  roleId: string,
+  input: { name: string; description: string; permission_ids: string[]; expected_version: number },
+): Promise<AdminRole> {
+  return requestJson<AdminRole>(
+    `${API_PREFIX}/admin/roles/${encodeURIComponent(roleId)}`,
+    { method: 'PUT', body: JSON.stringify(input) },
+    true,
+  );
+}
+
+export function deleteAdminRole(roleId: string, expectedVersion: number): Promise<void> {
+  return requestJson<{ deleted: true }>(
+    `${API_PREFIX}/admin/roles/${encodeURIComponent(roleId)}`,
+    {
+      method: 'DELETE',
+      body: JSON.stringify({ expected_version: expectedVersion }),
+    },
+    true,
+  ).then(() => undefined);
 }
 
 export function listAdminFacilities(cursor?: string): Promise<AdminListPayload<AdminFacility>> {
@@ -367,4 +465,50 @@ export function syncAdminFacilities(): Promise<FacilitySyncPayload> {
     { method: 'POST', body: JSON.stringify({}) },
     true,
   );
+}
+
+export function listAuditEvents(
+  cursor?: string,
+  filters: { action?: string; outcome?: string } = {},
+): Promise<AdminListPayload<AuditEvent>> {
+  const params = new URLSearchParams();
+  if (cursor) params.set('cursor', cursor);
+  if (filters.action?.trim()) params.set('action', filters.action.trim());
+  if (filters.outcome?.trim()) params.set('outcome', filters.outcome.trim());
+  const query = params.size ? `?${params.toString()}` : '';
+  return requestJson<AdminListPayload<AuditEvent>>(`${API_PREFIX}/admin/audit-events${query}`);
+}
+
+export function listAnalysisHistory(
+  cursor?: string,
+  favoriteOnly = false,
+): Promise<AdminListPayload<AnalysisHistoryItem>> {
+  const params = new URLSearchParams();
+  if (cursor) params.set('cursor', cursor);
+  if (favoriteOnly) params.set('favorite', 'true');
+  const query = params.size ? `?${params.toString()}` : '';
+  return requestJson<AdminListPayload<AnalysisHistoryItem>>(`${API_PREFIX}/history${query}`);
+}
+
+export function updateHistoryFavorite(
+  historyId: string,
+  favorite: boolean,
+  version: number,
+): Promise<AnalysisHistoryItem> {
+  return requestJson<AnalysisHistoryItem>(
+    `${API_PREFIX}/history/${encodeURIComponent(historyId)}/favorite`,
+    {
+      method: 'PATCH',
+      body: JSON.stringify({ is_favorite: favorite, version }),
+    },
+    true,
+  );
+}
+
+export function deleteAnalysisHistory(historyId: string): Promise<void> {
+  return requestJson<{ deleted: true }>(
+    `${API_PREFIX}/history/${encodeURIComponent(historyId)}`,
+    { method: 'DELETE' },
+    true,
+  ).then(() => undefined);
 }

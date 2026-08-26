@@ -14,6 +14,7 @@ app = create_app(
         app_environment="development",
         auth_enforcement_enabled=True,
         auth_session_cookie_secure=False,
+        auth_dev_expose_password_reset_token=True,
         rate_limit_enabled=False,
         mcp_allow_unscoped_tools=False,
     )

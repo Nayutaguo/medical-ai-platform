@@ -292,6 +292,7 @@ def test_002_migration_remains_immutable_and_down_is_reverse_order() -> None:
             "ck_audit_events_actor_context",
             "fk_one_time_tokens_membership_context",
             "ck_one_time_tokens_invitation_purpose",
+            "ck_one_time_tokens_purpose",
             "ck_one_time_tokens_identity_version_positive",
         }
     )

@@ -1,15 +1,16 @@
 # Project status
 
-Last updated: 2026-08-25.
+Last updated: 2026-08-26.
 
 ## Delivery position
 
 The repository is in Phase 2.5 product governance and early Phase 3 Agent
-workflow. The aggregate analysis loop works, and the first authenticated,
-tenant-aware privacy boundary is implemented. It is still **not a production
-release**: the local full dataset and first organization-administration slice
-are implemented, but administration integration acceptance, durable audit/job
-integration, production data operations, and release testing remain open.
+workflow. The aggregate analysis loop and the requested training-completion
+features now work: history/favorites/local exports, custom roles, password
+lifecycle, and an audit-query page. It is still **not a production release**:
+the local full dataset and training UI are implemented, but complete audit and
+job integration, production password-reset delivery, data operations, and
+release acceptance remain open.
 
 Estimated position against the documented end state:
 
@@ -43,17 +44,18 @@ entry point.
 
 ### Identity, authorization, and browser flow
 
-- Alembic migrations cover tenant-bound invitations through
-  `006_invitation_registration`; local application and drift verification are
-  part of the current registration slice.
-- Fifteen control-plane tables cover users, organizations, memberships, roles,
-  permissions, role grants, opaque sessions, one-time token placeholders,
+- Alembic migrations cover tenant-bound invitations and demo completion through
+  `007_demo_completion`; local application and drift verification are part of
+  the current slice.
+- Sixteen control-plane tables cover users, organizations, memberships, roles,
+  permissions, role grants, opaque sessions, digest-only invitation/reset tokens,
   append-only audit storage, jobs, datasets, facilities, organization ownership,
-  and membership facility scopes.
+  membership facility scopes, and membership-scoped analysis history.
 - Passwords use Argon2id. Session and CSRF values use random opaque tokens; only
   fixed-width digests are persisted.
-- Login, invitation-only registration, current-session, and CSRF-protected logout
-  APIs are implemented.
+- Login, invitation-only registration, current-session, CSRF-protected logout,
+  change-password, enumeration-safe reset request, and single-use token reset
+  APIs are implemented. Password changes/resets revoke all identity sessions.
 - The existing frontend now has login/register tabs, session/exit controls, and
   a permission-pending state. The three-column workbench layout is unchanged.
 - `AccessContext` is immutable and carries exact permission and facility facts.
@@ -67,6 +69,10 @@ entry point.
   replacement, membership suspension/reactivation, and facility synchronization.
   Every write requires CSRF and exact permissions; membership writes also use
   optimistic `expected_version` checks.
+- Tenant administrators with `roles.assign` can list the stable permission
+  catalog and create, edit, or delete unused custom roles. Built-in roles are
+  immutable; role edits use optimistic versions and invalidate affected member
+  sessions.
 
 ### Tenant and database integrity
 
@@ -80,9 +86,11 @@ entry point.
 - Audit identity references use retention-safe semantics rather than cascade
   deletion.
 - Successful invitation, membership-role, facility-scope, membership-status,
-  and facility-catalog mutations append sanitized audit facts in the same MySQL
-  transaction as the control-plane write. Attempt/failure and outbox coverage
-  remain incomplete.
+  facility-catalog, custom-role, and password lifecycle mutations append
+  sanitized audit facts in the same MySQL transaction as the control-plane
+  write. Administrators with `audit.read` can query a redacted tenant-bound
+  projection. Attempt/failure and cross-service outbox coverage remain
+  incomplete.
 - Facility-catalog synchronization requires an explicit
   `INPATIENT_DATASET_OWNER_ORGANIZATION_ID` match and cannot bind the global
   inpatient catalog to an arbitrary first caller.
@@ -117,6 +125,10 @@ entry point.
 - LLM empty/non-JSON/disconnected/429/5xx responses have bounded retries and
   stable 502/504 mapping. A failed second insight call does not discard a
   completed aggregate result.
+- Successful authenticated QuerySpec and Agent runs append a membership-scoped
+  history summary. History stores validated reusable specs, numeric metadata,
+  and sanitized chart shape only; it stores no result rows, SQL, trusted scope,
+  or original Agent question. Favorite writes use optimistic versions.
 
 ### API, frontend, and operational safeguards
 
@@ -139,15 +151,22 @@ entry point.
   out of browser storage, chains optimistic versions across role/scope writes,
   treats an empty facility scope as deny-all, and prevents self-status changes
   in the normal UI. Backend authorization remains the enforcement boundary.
+- The frontend now exposes history/favorites/reuse, custom-role editing,
+  password change/recovery, and audit filtering without changing the core
+  workbench layout. Session-bound analysis state is cleared on logout, password
+  change, authentication loss, and account switching.
+- CSV, chart PNG, and HTML reports are generated locally from the currently
+  displayed authorized aggregate response. They escape/sanitize content and
+  mark truncation, but are explicitly demo conveniences rather than
+  server-authorized/audited export jobs.
 
 ## Verified state
 
-- Python/unit-backed suite: **428 passed**.
-- Normal full suite: **428 passed, 9 external integrations skipped**.
+- Normal Python suite: **463 passed, 9 external integrations skipped**.
 - Real local MySQL integration suite: **9 passed** with `RUN_MYSQL_TESTS=1`.
-- Alembic: `006_invitation_registration (head)` and
+- Alembic: `007_demo_completion (head)` applied locally and
   `No new upgrade operations detected`.
-- Frontend: **12 Vitest/Testing Library checks passed**; the TypeScript check and
+- Frontend: **27 Vitest/Testing Library checks passed**; the TypeScript check and
   production Vite build pass. The only build note is the existing bundle-size
   warning.
 - Python compileall and `git diff --check` pass.
@@ -171,26 +190,29 @@ policy exists.
    reconciliation, backup/restore drills, and production-like load acceptance.
    The local controlled CLI acceptance is complete, but it is not yet an
    operator-facing import product.
-2. Complete administration release acceptance. The first backend/API/UI slice
-   now provisions invited members with roles and explicit facility scopes, but
-   real-MySQL mutation tests, cross-tenant/outage tests, authenticated browser
-   E2E, role-definition administration, and operational runbooks remain.
+2. Complete administration release acceptance. The backend/API/UI now covers
+   invited members, roles, explicit facility scopes, custom-role definitions,
+   and audit browsing, but broader real-MySQL mutation tests,
+   cross-tenant/outage tests, authenticated browser E2E, and operational
+   runbooks remain.
 3. Connect audit attempt/success/failure events to login, logout, denied access,
    query, Agent, import, and remaining administration paths. Successful
    administration mutations now write transactionally, but failures and
    cross-service operations still require a transaction-aware writer or outbox.
-4. Add privileged-account MFA/step-up. Invitation activation now uses tenant,
-   membership, purpose, identity-version, expiry, and atomic single-use binding;
-   password reset remains disabled until it satisfies the same standard.
+4. Add privileged-account MFA/step-up and a reviewed production email/SMS
+   password-reset delivery adapter. Reset credentials already use tenant,
+   membership, purpose, identity-version, expiry, digest-only storage, and
+   atomic single-use binding; only an explicit loopback development flag may
+   reveal the token once.
 5. Separate production database credentials for analytics read-only, control
    read/write, audit insert, and migration/ingestion. Verify grants against real
    MySQL.
 6. Add query/Agent shared rate limits, per-user/organization privacy budgets,
    rounding or minimum cohort-delta policy, and repeated-overlap detection.
    Minimum-group protection alone is not formal differential privacy.
-7. Move Agent, import, export, and report work out of synchronous Gunicorn into
-   durable MySQL job state plus Celery/Redis delivery, idempotent workers,
-   bounded retry, heartbeat, cancellation, and recovery.
+7. Move Agent, import, production export, and report work out of synchronous
+   Gunicorn into durable MySQL job state plus Celery/Redis delivery, idempotent
+   workers, bounded retry, heartbeat, cancellation, and recovery.
 8. Deliver a production deployment and recovery chain: TLS reverse proxy,
    secrets management, process supervision/containers, CI/CD, backups and restore
    drill, structured metrics/logs, dashboards, alerts, load tests, and rollback.
@@ -201,8 +223,9 @@ policy exists.
 - Add frontend unit/component tests and authenticated browser E2E coverage.
 - Add query caching only after permission/scope/privacy checks; cache keys must
   include tenant, scope, permission version, and dataset version.
-- Add complete public API schemas, pagination/export contracts, and operational
-  runbooks.
+- Add remaining public API schemas, server-side export contracts, and
+  operational runbooks. The current browser-local export behavior is documented
+  but is not the production contract.
 - Add provider governance for sending aggregate rows to an external LLM,
   including a data-processing agreement, field policy, cost/SLA monitoring, and
   an option to disable second-call interpretation.
@@ -216,17 +239,16 @@ policy exists.
 
 ## Working tree and handoff
 
-The active branch is `feat/full-data-pipeline`, based on the latest
-`origin/main`. The full-data pipeline changes are not yet committed. Before
-synchronization, keep them as focused Conventional Commits for cleaning rules,
-safe import state, tests, and documentation. Do not commit `.env`, raw/cleaned
+The active branch is `feat/full-data-pipeline`, based on `origin/main`. Before
+synchronization, keep the completion slice in focused Conventional Commits and
+do not commit `.env`, raw/cleaned
 data, profiles, manifests, load audits, database exports, retained MySQL backup
 contents, logs, `frontend/dist`, or generated caches.
 
 ## Next implementation order
 
-1. Administration real-MySQL/browser acceptance, role-definition operations,
-   and complete attempt/failure audit/outbox integration.
+1. Administration real-MySQL/browser acceptance and complete attempt/failure
+   audit/outbox integration.
 2. Connect the accepted full-data pipeline to durable job/dataset-version state,
    checkpoint/recovery, and facility mapping governance.
 3. Redis query/Agent limits and durable Celery jobs.

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from hmac import compare_digest
 from uuid import uuid4
 
 from medical_ai.authorization import AccessContext
@@ -11,11 +12,22 @@ from medical_ai.identity.errors import (
     AuthenticationRequiredError,
     CsrfValidationError,
     InvalidCredentialsError,
+    InvalidCurrentPasswordError,
+    InvalidPasswordResetError,
     MembershipUnavailableError,
     OrganizationSelectionRequiredError,
 )
 from medical_ai.identity.emails import normalize_ascii_email
-from medical_ai.identity.models import ActiveSession, IssuedSession, MembershipGrant, NewSession
+from medical_ai.identity.models import (
+    ActiveSession,
+    IssuedPasswordReset,
+    IssuedSession,
+    MembershipGrant,
+    NewSession,
+    PasswordChangePlan,
+    PasswordResetPlan,
+    PasswordResetTokenPlan,
+)
 from medical_ai.identity.passwords import Argon2idPasswordService
 from medical_ai.identity.ports import IdentityRepositoryPort
 from medical_ai.identity.tokens import generate_opaque_token, hash_opaque_token, verify_opaque_token
@@ -32,17 +44,21 @@ class AuthenticationService:
         idle_timeout: timedelta = timedelta(minutes=30),
         absolute_timeout: timedelta = timedelta(hours=12),
         touch_interval: timedelta = timedelta(minutes=5),
+        password_reset_lifetime: timedelta = timedelta(minutes=30),
         dummy_password_hash: str | None = None,
     ) -> None:
         if idle_timeout <= timedelta(0) or absolute_timeout <= timedelta(0):
             raise ValueError("Session timeouts must be positive")
         if idle_timeout > absolute_timeout:
             raise ValueError("Idle timeout cannot exceed absolute timeout")
+        if password_reset_lifetime <= timedelta(0) or password_reset_lifetime > timedelta(hours=24):
+            raise ValueError("Password reset lifetime must be between zero and 24 hours")
         self.repository = repository
         self.password_service = password_service or Argon2idPasswordService()
         self.idle_timeout = idle_timeout
         self.absolute_timeout = absolute_timeout
         self.touch_interval = touch_interval
+        self.password_reset_lifetime = password_reset_lifetime
         self._dummy_password_hash = dummy_password_hash or self.password_service.hash_password(
             "unusable dummy authentication password"
         )
@@ -165,6 +181,156 @@ class AuthenticationService:
         session = self.resolve_session(session_token, now=now)
         self.require_csrf(session, csrf_token)
         self.repository.revoke_session(session.session_id, revoked_at=current_time)
+
+    def change_password(
+        self,
+        session: ActiveSession,
+        current_password: str,
+        new_password: str,
+        *,
+        request_id: str | None,
+        now: datetime | None = None,
+    ) -> None:
+        """Replace the current identity's verifier and revoke every session."""
+
+        current_time = _utc_now(now)
+        user = self.repository.find_user_by_id(session.user_id)
+        eligible = bool(
+            user
+            and user.status == "active"
+            and user.password_hash
+            and user.password_algorithm == self.password_service.algorithm
+            and user.auth_version == session.access_context.identity_version
+        )
+        verifier = user.password_hash if eligible and user else self._dummy_password_hash
+        valid = self.password_service.verify_password(verifier, current_password)
+        if not eligible or not valid or user is None or user.password_hash is None:
+            raise InvalidCurrentPasswordError
+
+        password_hash = self.password_service.hash_password(new_password)
+        self.repository.change_password(
+            PasswordChangePlan(
+                context=session.access_context,
+                expected_password_hash=user.password_hash,
+                password_hash=password_hash,
+                password_algorithm=self.password_service.algorithm,
+                changed_at=current_time,
+                request_id=request_id,
+            )
+        )
+
+    def request_password_reset(
+        self,
+        email: str,
+        *,
+        organization_id: str | None = None,
+        request_id: str | None,
+        now: datetime | None = None,
+    ) -> IssuedPasswordReset | None:
+        """Issue a reset token for an eligible account without exposing lookup failures."""
+
+        current_time = _utc_now(now)
+        user = self.repository.find_user_by_normalized_email(normalize_email(email))
+        eligible = bool(
+            user
+            and user.status == "active"
+            and user.password_hash
+            and user.password_algorithm == self.password_service.algorithm
+        )
+        memberships = (
+            self.repository.list_active_memberships(user.user_id)
+            if eligible and user is not None
+            else []
+        )
+        if user is None or not eligible or not memberships:
+            return None
+
+        if organization_id is not None:
+            membership = next(
+                (
+                    item
+                    for item in memberships
+                    if item.organization_id == organization_id
+                ),
+                None,
+            )
+            if membership is None:
+                return None
+        else:
+            membership = min(memberships, key=lambda item: item.membership_id)
+        token = generate_opaque_token()
+        expires_at = current_time + self.password_reset_lifetime
+        created = self.repository.create_password_reset_token(
+            PasswordResetTokenPlan(
+                token_id=str(uuid4()),
+                token_hash=token.digest,
+                user_id=user.user_id,
+                organization_id=membership.organization_id,
+                membership_id=membership.membership_id,
+                identity_version=user.auth_version,
+                expires_at=expires_at,
+                created_at=current_time,
+                request_id=request_id,
+            )
+        )
+        if not created:
+            return None
+        return IssuedPasswordReset(
+            token=token.value,
+            expires_at=expires_at,
+            organization_id=membership.organization_id,
+        )
+
+    def reset_password(
+        self,
+        token: str,
+        email: str,
+        organization_id: str,
+        new_password: str,
+        *,
+        request_id: str | None,
+        now: datetime | None = None,
+    ) -> None:
+        """Consume one identity-version-bound token and revoke all sessions."""
+
+        current_time = _utc_now(now)
+        # Public password policy is evaluated before token lookup so malformed
+        # passwords cannot be used as an oracle for reset-token validity.
+        password_hash = self.password_service.hash_password(new_password)
+        token_hash = hash_opaque_token(token)
+        challenge = self.repository.find_password_reset_challenge(
+            token_hash=token_hash,
+            now=current_time,
+        )
+        if challenge is None:
+            raise InvalidPasswordResetError
+        normalized_email = normalize_email(email)
+        if not (
+            compare_digest(
+                normalized_email.encode("utf-8"),
+                challenge.email_normalized.encode("utf-8"),
+            )
+            and compare_digest(
+                organization_id.encode("utf-8"),
+                challenge.organization_id.encode("utf-8"),
+            )
+        ):
+            raise InvalidPasswordResetError
+        self.repository.consume_password_reset(
+            PasswordResetPlan(
+                token_hash=token_hash,
+                password_hash=password_hash,
+                password_algorithm=self.password_service.algorithm,
+                expected_user_id=challenge.user_id,
+                expected_organization_id=challenge.organization_id,
+                expected_membership_id=challenge.membership_id,
+                expected_identity_version=challenge.identity_version,
+                expected_user_version=challenge.user_version,
+                expected_token_version=challenge.token_version,
+                completed_at=current_time,
+                request_id=request_id,
+            )
+        )
 
 
 def normalize_email(email: str) -> str:
