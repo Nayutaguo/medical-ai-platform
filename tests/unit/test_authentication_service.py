@@ -120,6 +120,7 @@ def test_login_persists_only_session_and_csrf_digests(password_service) -> None:
     assert issued.session_token.encode() not in stored.session_token_hash
     assert stored.identity_version == 4
     assert stored.authorization_version == 3
+    assert issued.active_session.access_context.session_id == stored.session_id
     assert stored.idle_expires_at < stored.expires_at
     assert "session_token" not in repr(issued)
     public = issued.active_session.to_public_dict()
@@ -141,6 +142,32 @@ def test_unknown_and_mismatched_credentials_share_one_error(
 
     with pytest.raises(InvalidCredentialsError, match="邮箱或密码不正确"):
         _service(repository, password_service).login("analyst@example.com", password, now=NOW)
+
+    assert repository.created_session is None
+
+
+@pytest.mark.parametrize(
+    "email",
+    ["ü@example.com", "josé@example.com", "K@example.com", "ſ@example.com", "ß@example.com"],
+)
+def test_login_rejects_non_ascii_email_as_invalid_credentials(
+    password_service,
+    email: str,
+) -> None:
+    password = "correct horse battery staple"
+    known_user = UserCredential(
+        user_id="user-jose",
+        email="jose@example.com",
+        display_name="Jose",
+        status="active",
+        password_hash=password_service.hash_password(password),
+        password_algorithm="argon2id",
+        auth_version=1,
+    )
+    repository = FakeIdentityRepository(known_user, [_membership()])
+
+    with pytest.raises(InvalidCredentialsError):
+        _service(repository, password_service).login(email, password, now=NOW)
 
     assert repository.created_session is None
 

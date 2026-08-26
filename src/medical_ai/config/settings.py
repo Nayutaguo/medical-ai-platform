@@ -22,6 +22,7 @@ class Settings(BaseSettings):
     query_max_distinct_values: int = 200
     query_timeout_ms: int = 30000
     privacy_min_group_size: int = Field(default=5, ge=2, le=100)
+    inpatient_dataset_owner_organization_id: str = Field(default="", max_length=36)
 
     api_max_body_bytes: int = 2_000_000
     api_max_question_chars: int = 2_000

@@ -5,7 +5,7 @@ from medical_ai.authorization import AccessContext, PermissionCode
 from medical_ai.config import Settings
 from medical_ai.identity.errors import InvalidCredentialsError, InvalidInvitationError
 from medical_ai.identity.passwords import PasswordPolicyError
-from medical_ai.identity.models import ActiveSession, IssuedSession
+from medical_ai.identity.models import ActiveSession, IssuedSession, RegistrationResult
 from medical_ai.identity.tokens import hash_opaque_token
 from medical_ai.services import ServiceResult
 
@@ -55,7 +55,13 @@ class FakeInvitationRegistrationService:
         self.calls.append(kwargs)
         if self.failure is not None:
             raise self.failure
-        return object()
+        return RegistrationResult(
+            user_id="user-1",
+            organization_id="organization-invited",
+            membership_id="membership-invited",
+            email="invited@example.com",
+            display_name="Invited Analyst",
+        )
 
 
 def _active_session() -> ActiveSession:
@@ -123,7 +129,10 @@ def test_invitation_registration_activates_account_without_returning_secrets() -
     )
 
     assert response.status_code == 201
-    assert response.get_json()["data"] == {"registered": True}
+    assert response.get_json()["data"] == {
+        "registered": True,
+        "organization_id": "organization-invited",
+    }
     serialized = response.get_data(as_text=True)
     assert "single-use-bearer-token" not in serialized
     assert "correct horse battery staple" not in serialized
@@ -241,6 +250,8 @@ def test_login_sets_securely_scoped_httponly_cookie_without_returning_session_to
     payload = response.get_json()
     assert payload["success"] is True
     assert payload["data"]["csrf_token"] == service.csrf_token
+    assert payload["data"]["csrf_cookie_name"] == "medical_ai_csrf"
+    assert payload["data"]["csrf_header_name"] == "X-CSRF-Token"
     assert payload["data"]["session"]["user"]["email"] == "analyst@example.com"
     assert service.session_token not in response.get_data(as_text=True)
     cookies = response.headers.getlist("Set-Cookie")
@@ -267,6 +278,8 @@ def test_current_session_uses_cookie_and_returns_no_secrets() -> None:
 
     assert response.status_code == 200
     assert service.resolve_calls == [service.session_token]
+    assert response.get_json()["data"]["csrf_cookie_name"] == "medical_ai_csrf"
+    assert response.get_json()["data"]["csrf_header_name"] == "X-CSRF-Token"
     serialized = response.get_data(as_text=True)
     assert service.session_token not in serialized
     assert "csrf_token_hash" not in serialized

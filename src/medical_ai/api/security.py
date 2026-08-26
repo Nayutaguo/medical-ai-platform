@@ -13,6 +13,7 @@ from medical_ai.identity.models import ActiveSession
 from medical_ai.rate_limit import LoginRateLimiter, RedisLoginRateLimiter
 from medical_ai.repositories import IdentityRepository
 from medical_ai.services import AuthenticationService
+from medical_ai.services.governance_administration import GovernanceAdministrationService
 from medical_ai.services.invitation_registration import InvitationRegistrationService
 
 
@@ -40,6 +41,20 @@ def invitation_registration_service() -> InvitationRegistrationService:
         service = InvitationRegistrationService(IdentityRepository(settings=_settings()))
         current_app.extensions["invitation_registration_service"] = service
     return cast(InvitationRegistrationService, service)
+
+
+def governance_administration_service() -> GovernanceAdministrationService:
+    """Return the app-scoped tenant administration service lazily."""
+
+    service = current_app.extensions.get("governance_administration_service")
+    if service is None:
+        repository = IdentityRepository(settings=_settings())
+        service = GovernanceAdministrationService(
+            repository,
+            invitation_service=InvitationRegistrationService(repository),
+        )
+        current_app.extensions["governance_administration_service"] = service
+    return cast(GovernanceAdministrationService, service)
 
 
 def login_rate_limiter() -> LoginRateLimiter | None:

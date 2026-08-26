@@ -35,6 +35,7 @@ class AccessContext:
     allowed_facility_ids: frozenset[str]
     identity_version: int
     authorization_version: int
+    session_id: str | None = None
 
     def __post_init__(self) -> None:
         """Normalize immutable collections and reject malformed domain state."""
@@ -65,6 +66,12 @@ class AccessContext:
             raise ValueError("identity_version must be greater than or equal to 1")
         if self.authorization_version < 1:
             raise ValueError("authorization_version must be greater than or equal to 1")
+        if self.session_id is not None:
+            object.__setattr__(
+                self,
+                "session_id",
+                _required_identifier(self.session_id, "session_id"),
+            )
 
     def has_permission(self, permission: PermissionCode) -> bool:
         """Return whether the context contains exactly ``permission``."""
