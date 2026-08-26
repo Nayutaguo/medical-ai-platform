@@ -7,6 +7,7 @@ from uuid import uuid4
 
 from flask import Flask, abort, g, request, send_from_directory
 
+from medical_ai.api.admin_routes import admin_api
 from medical_ai.api.auth_routes import auth_api
 from medical_ai.api.errors import register_error_handlers
 from medical_ai.api.routes import api_v1
@@ -23,6 +24,7 @@ def create_app(
     authentication_service=None,
     invitation_registration_service=None,
     login_rate_limiter=None,
+    governance_administration_service=None,
 ) -> Flask:
     """Create the Flask application without connecting to external services eagerly."""
 
@@ -40,8 +42,10 @@ def create_app(
     app.extensions["authentication_service"] = authentication_service
     app.extensions["invitation_registration_service"] = invitation_registration_service
     app.extensions["login_rate_limiter"] = login_rate_limiter
+    app.extensions["governance_administration_service"] = governance_administration_service
     app.register_blueprint(api_v1)
     app.register_blueprint(auth_api)
+    app.register_blueprint(admin_api)
 
     @app.before_request
     def inject_request_context() -> None:

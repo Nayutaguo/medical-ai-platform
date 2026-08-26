@@ -14,6 +14,7 @@ from medical_ai.identity.errors import (
     MembershipUnavailableError,
     OrganizationSelectionRequiredError,
 )
+from medical_ai.identity.emails import normalize_ascii_email
 from medical_ai.identity.models import ActiveSession, IssuedSession, MembershipGrant, NewSession
 from medical_ai.identity.passwords import Argon2idPasswordService
 from medical_ai.identity.ports import IdentityRepositoryPort
@@ -102,6 +103,7 @@ class AuthenticationService:
             allowed_facility_ids=membership.allowed_facility_ids,
             identity_version=user.auth_version,
             authorization_version=membership.authorization_version,
+            session_id=session_id,
         )
         active = ActiveSession(
             session_id=session_id,
@@ -168,11 +170,9 @@ class AuthenticationService:
 def normalize_email(email: str) -> str:
     """Normalize an email identifier for unique lookup without logging it."""
 
-    normalized = email.strip().casefold() if isinstance(email, str) else ""
-    if not normalized or len(normalized) > 320 or "@" not in normalized:
-        # Keep login responses indistinguishable from unknown identifiers.
-        return "invalid-login-identifier"
-    return normalized
+    # Keep malformed and unsupported EAI identifiers indistinguishable from an
+    # unknown account at the public login boundary.
+    return normalize_ascii_email(email) or "invalid-login-identifier"
 
 
 def _select_membership(

@@ -27,6 +27,8 @@ export interface LoginCredentials {
 export interface LoginPayload {
   session: AuthSession;
   csrf_token: string;
+  csrf_cookie_name: string;
+  csrf_header_name: string;
 }
 
 export interface RegistrationCredentials {
@@ -38,14 +40,63 @@ export interface RegistrationCredentials {
 
 export interface RegistrationPayload {
   registered: true;
+  organization_id: string;
 }
 
 export interface CurrentSessionPayload {
   session: AuthSession;
+  csrf_cookie_name: string;
+  csrf_header_name: string;
 }
 
 export interface LogoutPayload {
   revoked: boolean;
+}
+
+export interface AdminRole {
+  id: string;
+  role_key: string;
+  name: string;
+  description: string | null;
+  permissions: string[];
+  version: number;
+}
+
+export interface AdminFacility {
+  id: string;
+  facility_key: string;
+  display_name: string | null;
+  status: 'active' | 'disabled';
+  version: number;
+}
+
+export interface AdminMember {
+  membership_id: string;
+  user_id: string;
+  email: string;
+  display_name: string;
+  user_status: 'invited' | 'active' | 'suspended' | 'disabled';
+  membership_status: 'invited' | 'active' | 'suspended' | 'removed';
+  authorization_version: number;
+  version: number;
+  roles: AdminRole[];
+  facilities: AdminFacility[];
+}
+
+export interface AdminListPayload<T> {
+  items: T[];
+  next_cursor: string | null;
+}
+
+export interface IssuedInvitation {
+  membership_id: string;
+  token: string;
+  expires_at: string;
+}
+
+export interface FacilitySyncPayload {
+  created_count: number;
+  existing_count: number;
 }
 
 export interface SchemaColumn {

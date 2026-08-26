@@ -97,6 +97,11 @@ Use a streaming standard-library CSV cleaner for the first SPARCS ingestion scri
 
 Rationale: the real SPARCS 2021 CSV is about 794 MB with about 2.1 million lines. The first ingestion path only needs deterministic column mapping, normalization, numeric parsing, and CSV output, so a streaming script is simpler and lower memory than loading the full file into a DataFrame.
 
+Status update: the streaming path now produces an atomically published cleaned
+CSV, quality profile, and manifest, followed by a staging/atomic MySQL publish.
+The accepted recovery semantics are recorded in
+[`docs/adr/0004-recoverable-full-data-publish.md`](adr/0004-recoverable-full-data-publish.md).
+
 ## D011 - Minimal OpenAI-Compatible LLM Client First
 
 Date: 2026-08-18

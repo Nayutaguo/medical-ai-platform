@@ -8,10 +8,12 @@ from werkzeug.exceptions import HTTPException
 
 from medical_ai.authorization import AuthorizationError
 from medical_ai.identity.errors import (
+    AdministrationError,
     AuthenticationRequiredError,
     CsrfValidationError,
     InvalidCredentialsError,
     InvalidInvitationError,
+    InvitationCreationError,
     MembershipUnavailableError,
     OrganizationSelectionRequiredError,
 )
@@ -105,6 +107,33 @@ def register_error_handlers(app: Flask) -> None:
         return error_response(
             status=400,
             code="INVALID_INVITATION",
+            message=str(exc),
+        )
+
+    @app.errorhandler(InvitationCreationError)
+    def handle_invitation_creation(exc: InvitationCreationError):
+        app.logger.warning(
+            "invitation_creation_conflict request_id=%s code=%s",
+            current_request_id(),
+            exc.error_code,
+        )
+        return error_response(
+            status=409,
+            code="INVITATION_CONFLICT",
+            message=str(exc),
+        )
+
+    @app.errorhandler(AdministrationError)
+    def handle_administration_error(exc: AdministrationError):
+        app.logger.warning(
+            "administration_error request_id=%s code=%s status=%s",
+            current_request_id(),
+            exc.error_code,
+            exc.http_status,
+        )
+        return error_response(
+            status=exc.http_status,
+            code=exc.error_code,
             message=str(exc),
         )
 

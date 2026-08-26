@@ -34,10 +34,37 @@ _DETAIL_KEYS = frozenset(
         "job_type",
         "role_keys",
         "facility_count",
+        "created_count",
+        "existing_count",
+        "previous_role_keys",
+        "new_role_keys",
+        "previous_facility_count",
+        "new_facility_count",
+        "previous_facility_scope_digest",
+        "new_facility_scope_digest",
+        "previous_status",
+        "new_status",
     }
 )
-_LIST_DETAIL_KEYS = frozenset({"dimensions", "metrics", "role_keys"})
-_COUNT_DETAIL_KEYS = frozenset({"row_count", "facility_count"})
+_LIST_DETAIL_KEYS = frozenset(
+    {
+        "dimensions",
+        "metrics",
+        "role_keys",
+        "previous_role_keys",
+        "new_role_keys",
+    }
+)
+_COUNT_DETAIL_KEYS = frozenset(
+    {
+        "row_count",
+        "facility_count",
+        "created_count",
+        "existing_count",
+        "previous_facility_count",
+        "new_facility_count",
+    }
+)
 _SENSITIVE_KEY_PARTS = (
     "prompt",
     "question",

@@ -82,27 +82,45 @@ Load synthetic development data:
 conda run -n medical-ai python scripts/load_sample_mysql.py --replace
 ```
 
-Clean and load a 1000-row development subset from the real SPARCS CSV:
+Clean a 1000-row development subset from the real SPARCS CSV:
 
 ```bash
 conda run -n medical-ai python scripts/clean_sparcs_csv.py --limit 1000 --output data/processed/inpatient_sparcs_2021_clean_1000.csv
-conda run -n medical-ai python scripts/load_sparcs_mysql.py --csv data/processed/inpatient_sparcs_2021_clean_1000.csv --replace-table
 ```
 
-For the full SPARCS file, omit `--limit`. `data/processed/*` is ignored by Git.
+The subset manifest has `source_complete=false` and cannot replace the governed
+live table. For the full SPARCS file, omit `--limit`. `data/processed/*` is
+ignored by Git.
 
 Fast full-load path:
 
 ```bash
 sudo mysql -e "SET GLOBAL local_infile = 1; SHOW GLOBAL VARIABLES LIKE 'local_infile';"
-conda run -n medical-ai python scripts/load_sparcs_mysql.py --csv data/processed/inpatient_sparcs_2021_clean.csv --replace-table --method load-data
+conda run -n medical-ai python scripts/load_sparcs_mysql.py \
+  --csv data/processed/inpatient_sparcs_2021_clean.csv \
+  --source-manifest data/processed/inpatient_sparcs_2021_clean.manifest.json \
+  --dry-run
+conda run -n medical-ai python scripts/load_sparcs_mysql.py \
+  --csv data/processed/inpatient_sparcs_2021_clean.csv \
+  --source-manifest data/processed/inpatient_sparcs_2021_clean.manifest.json \
+  --method load-data
 ```
 
 If `local_infile` cannot be enabled, use the slower batch-insert path:
 
 ```bash
-conda run -n medical-ai python scripts/load_sparcs_mysql.py --csv data/processed/inpatient_sparcs_2021_clean.csv --replace-table --method insert
+conda run -n medical-ai python scripts/load_sparcs_mysql.py \
+  --csv data/processed/inpatient_sparcs_2021_clean.csv \
+  --source-manifest data/processed/inpatient_sparcs_2021_clean.manifest.json \
+  --method insert
 ```
+
+The full loader requires a successful complete cleaning manifest, loads an
+isolated staging table, verifies quality and indexes, and atomically publishes
+the new table while retaining the previous live table for rollback. It writes a
+task-specific private append-only JSON Lines audit. Detailed acceptance facts
+and recovery behavior are in [`docs/DATA_CLEANING.md`](docs/DATA_CLEANING.md) and
+[`docs/adr/0004-recoverable-full-data-publish.md`](docs/adr/0004-recoverable-full-data-publish.md).
 
 Verify:
 
@@ -127,8 +145,10 @@ dropped by the control-plane migration. The reviewed rollback is available as
 `alembic downgrade 001_existing_analytics_baseline`; it destroys control-plane
 data and must not be run as a routine operation.
 
-The current browser-session endpoints and their error/cookie contract are
-documented in [`docs/API_AUTH.md`](docs/API_AUTH.md).
+The browser-session and invited-registration contract is documented in
+[`docs/API_AUTH.md`](docs/API_AUTH.md). Tenant administration endpoints,
+permissions, optimistic versions, and facility-scope rules are documented in
+[`docs/API_ADMIN.md`](docs/API_ADMIN.md).
 
 Create the first organization administrator once, after migration. The password
 is prompted securely and there is no shipped default credential:
@@ -145,9 +165,22 @@ The bootstrap administrator receives governance permissions only. Analytical
 permissions and facility access must be assigned explicitly after data scopes
 are configured.
 
+Before the first facility-catalog synchronization, bind the imported inpatient
+dataset to that organization in the ignored local `.env`:
+
+```dotenv
+INPATIENT_DATASET_OWNER_ORGANIZATION_ID=<organization-uuid>
+```
+
+The value is the organization ID shown by the bootstrap command. A missing or
+different value makes synchronization fail closed; it is never inferred from
+the first administrator who clicks the button.
+
 Additional users register only from an administrator-issued, one-time
-invitation. Until the administration UI is delivered, a trusted operator can
-issue a 24-hour invitation from the local control-plane environment:
+invitation. An authenticated member with `users.manage` can issue it from the
+management workspace or `POST /api/v1/admin/invitations`. A trusted local
+operator can also use the control-plane command when recovering or verifying a
+development environment:
 
 ```bash
 conda run -n medical-ai python scripts/create_user_invitation.py \
@@ -159,6 +192,8 @@ The command prints the bearer invitation once. Transfer it through an approved
 secret channel; never place it in Git, tickets, logs, or environment examples.
 The invited user enters it on the frontend **注册** tab. Registration activates
 only the user and organization membership; it grants no role or facility scope.
+The management workspace separately assigns an organization role and an
+explicit facility scope; an empty facility scope denies all medical-data access.
 
 ## Tests
 
@@ -172,9 +207,10 @@ Optional MySQL integration tests:
 RUN_MYSQL_TESTS=1 pytest tests/integration
 ```
 
-Current verified baseline: 291 unit tests pass, the normal suite skips six
-external integrations, and all six MySQL integrations pass when explicitly
-enabled. The frontend also passes `tsc --noEmit` and `npm run build`.
+Current verified baseline: 428 tests pass, the normal suite skips nine
+external integrations, and all nine MySQL integrations pass when explicitly
+enabled. The frontend has 12 Vitest/Testing Library checks and also passes
+`tsc --noEmit` and `npm run build`.
 
 ## Minimal Demo
 
@@ -295,9 +331,18 @@ Versioned endpoints:
 - `GET /api/v1/health`
 - `GET /api/v1/health/live`
 - `GET /api/v1/health/ready`
+- `POST /api/v1/auth/registrations`
 - `POST /api/v1/auth/sessions`
 - `GET /api/v1/auth/me`
 - `DELETE /api/v1/auth/sessions/current`
+- `GET /api/v1/admin/members`
+- `GET /api/v1/admin/roles`
+- `GET /api/v1/admin/facilities`
+- `POST /api/v1/admin/invitations`
+- `PUT /api/v1/admin/members/{membership_id}/roles`
+- `PUT /api/v1/admin/members/{membership_id}/facility-scope`
+- `PATCH /api/v1/admin/members/{membership_id}/status`
+- `POST /api/v1/admin/facilities/sync`
 - `GET /api/v1/schema`
 - `GET /api/v1/distinct`
 - `POST /api/v1/query`
@@ -307,6 +352,11 @@ Every response uses the stable `success/data/meta/error` envelope and returns an
 `X-Request-Id` header. Governed analytics require exact permissions, a non-empty
 trusted facility scope, approved field capabilities, and groups at or above the
 privacy threshold. See `docs/API_AUTH.md` and ADR 0003.
+Administration is tenant-bound, requires exact `users.manage`, `roles.assign`,
+or `imports.create` permissions by operation, and requires CSRF plus
+`expected_version` on membership writes. See `docs/API_ADMIN.md`.
+This is still a pre-production slice: privileged MFA/step-up, password reset,
+authenticated browser acceptance, and the production deployment chain remain.
 
 Start frontend:
 

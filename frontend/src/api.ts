@@ -1,8 +1,13 @@
 import type {
   AskPayload,
+  AdminFacility,
+  AdminListPayload,
+  AdminMember,
+  AdminRole,
   AuthSession,
   CurrentSessionPayload,
   DistinctPayload,
+  FacilitySyncPayload,
   HealthPayload,
   LoginCredentials,
   LoginPayload,
@@ -11,13 +16,16 @@ import type {
   RegistrationCredentials,
   RegistrationPayload,
   SchemaPayload,
+  IssuedInvitation,
 } from './types';
 
 const API_PREFIX = '/api/v1';
-const CSRF_HEADER_NAME = 'X-CSRF-Token';
-const CSRF_COOKIE_NAME = 'medical_ai_csrf';
+const DEFAULT_CSRF_HEADER_NAME = 'X-CSRF-Token';
+const DEFAULT_CSRF_COOKIE_NAME = 'medical_ai_csrf';
 
 let csrfToken: string | null = null;
+let csrfHeaderName = DEFAULT_CSRF_HEADER_NAME;
+let csrfCookieName = DEFAULT_CSRF_COOKIE_NAME;
 let anonymousDevelopmentMode = false;
 
 interface ApiErrorPayload {
@@ -74,7 +82,7 @@ async function requestJson<T>(path: string, options?: RequestInit, includeCsrf =
   }
   if (includeCsrf) {
     if (!anonymousDevelopmentMode) {
-      csrfToken ??= readCookie(CSRF_COOKIE_NAME);
+      csrfToken ??= readCookie(csrfCookieName);
       if (!csrfToken) {
         throw new ApiError({
           status: 403,
@@ -82,7 +90,7 @@ async function requestJson<T>(path: string, options?: RequestInit, includeCsrf =
           message: '当前会话的安全凭据已丢失，请重新登录',
         });
       }
-      headers.set(CSRF_HEADER_NAME, csrfToken);
+      headers.set(csrfHeaderName, csrfToken);
     }
   }
 
@@ -173,6 +181,7 @@ export function login(credentials: LoginCredentials): Promise<AuthSession> {
     }),
   }).then((payload) => {
     anonymousDevelopmentMode = false;
+    applyCsrfConfiguration(payload);
     csrfToken = payload.csrf_token;
     return payload.session;
   });
@@ -195,9 +204,10 @@ export async function getCurrentSession(): Promise<AuthSession> {
   try {
     const payload = await requestJson<CurrentSessionPayload>(`${API_PREFIX}/auth/me`);
     anonymousDevelopmentMode = false;
+    applyCsrfConfiguration(payload);
     // The server owns the cookie. We only copy its proof into module memory so
     // a restored session can make CSRF-protected requests without web storage.
-    csrfToken = readCookie(CSRF_COOKIE_NAME);
+    csrfToken = readCookie(csrfCookieName);
     return payload.session;
   } catch (error) {
     if (isAuthenticationDisabled(error)) {
@@ -206,6 +216,14 @@ export async function getCurrentSession(): Promise<AuthSession> {
     }
     throw error;
   }
+}
+
+function applyCsrfConfiguration(configuration: {
+  csrf_cookie_name: string;
+  csrf_header_name: string;
+}): void {
+  csrfCookieName = configuration.csrf_cookie_name || DEFAULT_CSRF_COOKIE_NAME;
+  csrfHeaderName = configuration.csrf_header_name || DEFAULT_CSRF_HEADER_NAME;
 }
 
 export function logout(): Promise<void> {
@@ -270,4 +288,83 @@ export async function runQuerySpec(querySpec: Record<string, unknown>): Promise<
     true,
   );
   return payload.result;
+}
+
+export function listAdminMembers(cursor?: string): Promise<AdminListPayload<AdminMember>> {
+  const query = cursor ? `?cursor=${encodeURIComponent(cursor)}` : '';
+  return requestJson<AdminListPayload<AdminMember>>(`${API_PREFIX}/admin/members${query}`);
+}
+
+export function listAdminRoles(cursor?: string): Promise<AdminListPayload<AdminRole>> {
+  const query = cursor ? `?cursor=${encodeURIComponent(cursor)}` : '';
+  return requestJson<AdminListPayload<AdminRole>>(`${API_PREFIX}/admin/roles${query}`);
+}
+
+export function listAdminFacilities(cursor?: string): Promise<AdminListPayload<AdminFacility>> {
+  const query = cursor ? `?cursor=${encodeURIComponent(cursor)}` : '';
+  return requestJson<AdminListPayload<AdminFacility>>(`${API_PREFIX}/admin/facilities${query}`);
+}
+
+export function issueAdminInvitation(email: string, lifetimeHours = 24): Promise<IssuedInvitation> {
+  return requestJson<IssuedInvitation>(
+    `${API_PREFIX}/admin/invitations`,
+    {
+      method: 'POST',
+      body: JSON.stringify({ email: email.trim(), lifetime_hours: lifetimeHours }),
+    },
+    true,
+  );
+}
+
+export function replaceAdminMemberRoles(
+  membershipId: string,
+  roleIds: string[],
+  expectedVersion: number,
+): Promise<AdminMember> {
+  return requestJson<AdminMember>(
+    `${API_PREFIX}/admin/members/${encodeURIComponent(membershipId)}/roles`,
+    {
+      method: 'PUT',
+      body: JSON.stringify({ role_ids: roleIds, expected_version: expectedVersion }),
+    },
+    true,
+  );
+}
+
+export function replaceAdminMemberFacilityScope(
+  membershipId: string,
+  facilityIds: string[],
+  expectedVersion: number,
+): Promise<AdminMember> {
+  return requestJson<AdminMember>(
+    `${API_PREFIX}/admin/members/${encodeURIComponent(membershipId)}/facility-scope`,
+    {
+      method: 'PUT',
+      body: JSON.stringify({ facility_ids: facilityIds, expected_version: expectedVersion }),
+    },
+    true,
+  );
+}
+
+export function updateAdminMemberStatus(
+  membershipId: string,
+  status: 'active' | 'suspended',
+  expectedVersion: number,
+): Promise<AdminMember> {
+  return requestJson<AdminMember>(
+    `${API_PREFIX}/admin/members/${encodeURIComponent(membershipId)}/status`,
+    {
+      method: 'PATCH',
+      body: JSON.stringify({ status, expected_version: expectedVersion }),
+    },
+    true,
+  );
+}
+
+export function syncAdminFacilities(): Promise<FacilitySyncPayload> {
+  return requestJson<FacilitySyncPayload>(
+    `${API_PREFIX}/admin/facilities/sync`,
+    { method: 'POST', body: JSON.stringify({}) },
+    true,
+  );
 }

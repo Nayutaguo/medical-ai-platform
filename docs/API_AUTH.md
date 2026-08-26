@@ -26,7 +26,20 @@ over loopback HTTP for local verification.
 `POST /api/v1/auth/registrations`
 
 Registration is invitation-only. The server never provides open self-signup and
-never assigns an analytics role or facility scope during activation.
+never assigns an analytics role or facility scope during activation. A global
+email identity may belong to multiple organizations:
+
+The first release accepts ASCII email identifiers only. It trims and
+case-folds them and rejects internationalized email addresses (EAI) until a
+binary-normalized database identity policy is introduced. Registration maps an
+unsupported email to the same public invalid-invitation response.
+
+- On its first acceptance, an `invited` identity sets its Argon2id password and
+  display name, activates the identity, and activates only the token-bound
+  membership.
+- When the identity is already `active`, the submitted password must verify the
+  existing credential. Acceptance activates only the new membership and never
+  replaces the password, display name, `auth_version`, or existing sessions.
 
 ```json
 {
@@ -39,28 +52,47 @@ never assigns an analytics role or facility scope during activation.
 
 The invitation is bound to one user, organization, membership, purpose,
 identity version, expiry, and email. MySQL stores only its digest. Consumption,
-user activation, membership activation, and the success audit row occur in one
-transaction; wrong, expired, replayed, cross-email, and stale invitations share
-the same public error.
+the required identity or membership activation, and the success audit row occur
+in one transaction. When the first password is established, other unconsumed
+and unexpired invitations for that identity are transactionally rebased to the
+new identity version; accepting them then requires the existing password.
+Wrong passwords, expired or replayed tokens, cross-email use, stale snapshots,
+and failed compare-and-swap writes share the same public error. Password policy
+is checked before token lookup so invalid short passwords cannot be used as a
+token-validity oracle.
 
 Success is HTTP 201:
 
 ```json
 {
   "success": true,
-  "data": {"registered": true},
+  "data": {
+    "registered": true,
+    "organization_id": "token-bound-organization-uuid"
+  },
   "meta": {"request_id": "request-id"},
   "error": null
 }
 ```
 
+`organization_id` is safe, token-bound login context. The client should pass it
+to `POST /api/v1/auth/sessions` after registration because a global identity may
+now have more than one active membership.
+
+If two organizations' invitations for the same not-yet-activated identity are
+accepted concurrently, exactly one request establishes the global identity.
+The lock victim receives the same `INVALID_INVITATION` response and may retry
+its still-valid, rebased token using the newly established password. The server
+does not automatically replay a transaction after password verification.
+
 Stable errors:
 
 - `400 INVALID_REQUEST`: missing, oversized, or unsupported fields.
 - `400 PASSWORD_POLICY_VIOLATION`: password policy failure with a password field
-  error; passwords are never echoed.
+  error; policy is evaluated before invitation lookup and passwords are never
+  echoed.
 - `400 INVALID_INVITATION`: one indistinguishable response for every unusable
-  invitation.
+  invitation, including a wrong existing-account password.
 - `429 LOGIN_RATE_LIMITED`: the shared source/account authentication bucket is
   exhausted; includes `Retry-After`.
 - `503 LOGIN_RATE_LIMIT_UNAVAILABLE`: enabled Redis protection cannot decide;
@@ -68,8 +100,9 @@ Stable errors:
 - `503 DATABASE_UNAVAILABLE`: activation cannot be committed.
 
 The frontend keeps invitation and password values only in component memory,
-clears them after success, and returns to the login tab. An activated account
-without `analytics.schema.read` sees a permission-pending state instead of an
+clears them after success, returns to the login tab, and prefills the
+token-bound organization ID. An activated account without
+`analytics.schema.read` sees a permission-pending state instead of an
 unguarded workbench.
 
 ## Create session
@@ -87,6 +120,10 @@ unguarded workbench.
 The optional organization is required when one identity has more than one active
 membership. Success is HTTP 201 and returns public session facts plus the CSRF
 proof. The raw session token is never returned in JSON.
+
+Login uses the same ASCII-only, trimmed, case-folded email identity policy as
+invitation and registration. Unsupported or malformed identifiers receive the
+same `INVALID_CREDENTIALS` response as an unknown account.
 
 ```json
 {
@@ -112,7 +149,9 @@ proof. The raw session token is never returned in JSON.
       "expires_at": "2026-08-24T22:00:00",
       "idle_expires_at": "2026-08-24T10:30:00"
     },
-    "csrf_token": "one-session-csrf-proof"
+    "csrf_token": "one-session-csrf-proof",
+    "csrf_cookie_name": "medical_ai_csrf",
+    "csrf_header_name": "X-CSRF-Token"
   },
   "meta": {"request_id": "request-id"},
   "error": null
@@ -141,9 +180,12 @@ Stable errors:
 
 `GET /api/v1/auth/me`
 
-Requires the opaque session cookie and returns the same public session shape. It
-does not return verifiers, token digests, facility scope internals, or database
-metadata.
+Requires the opaque session cookie and returns the same public session shape,
+plus the configured `csrf_cookie_name` and `csrf_header_name`. The SPA uses
+those public names to restore the proof into memory after refresh, so a valid
+deployment-specific name does not break subsequent writes. This endpoint does
+not return the proof value, verifiers, token digests, facility scope internals,
+or database metadata.
 
 Stable errors:
 

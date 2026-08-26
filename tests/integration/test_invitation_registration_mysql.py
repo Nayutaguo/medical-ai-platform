@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 import os
+from threading import Barrier
 from uuid import uuid4
 
 import pytest
@@ -201,4 +203,364 @@ def test_invitation_registration_is_bound_single_use_audited_and_unprivileged() 
             )
             if invitation is not None:
                 connection.execute(users.delete().where(users.c.id == invitation.user_id))
+        engine.dispose()
+
+
+@requires_mysql
+def test_cross_organization_acceptance_preserves_existing_identity() -> None:
+    settings = get_settings()
+    engine = create_engine(settings.mysql_url(), pool_pre_ping=True)
+    repository = IdentityRepository(settings=settings, engine=engine)
+    password_service = Argon2idPasswordService(
+        time_cost=1,
+        memory_cost_kib=8_192,
+        parallelism=1,
+    )
+    service = InvitationRegistrationService(
+        repository,
+        password_service=password_service,
+    )
+    organization_ids = tuple(str(uuid4()) for _ in range(3))
+    email = f"multi-org-{uuid4()}@example.invalid"
+    user_id: str | None = None
+
+    try:
+        with engine.begin() as connection:
+            connection.execute(
+                organizations.insert(),
+                [
+                    {
+                        "id": organization_id,
+                        "name": f"Synthetic Multi-Org Test {index}",
+                        "slug": f"multi-org-test-{uuid4()}",
+                        "status": "active",
+                    }
+                    for index, organization_id in enumerate(
+                        organization_ids,
+                        start=1,
+                    )
+                ],
+            )
+
+        first = service.issue_invitation(
+            organization_id=organization_ids[0],
+            email=email,
+            actor=AuditActor.system(organization_ids[0]),
+            now=datetime(2026, 8, 24, 10, 0, tzinfo=UTC),
+        )
+        second = service.issue_invitation(
+            organization_id=organization_ids[1],
+            email=email.upper(),
+            actor=AuditActor.system(organization_ids[1]),
+            now=datetime(2026, 8, 24, 10, 1, tzinfo=UTC),
+        )
+        user_id = first.user_id
+        assert second.user_id == first.user_id
+
+        service.register_invited_user(
+            token=first.token,
+            email=email,
+            display_name="Canonical Multi-Org User",
+            password="existing account password",
+            now=datetime(2026, 8, 24, 10, 2, tzinfo=UTC),
+        )
+        with engine.connect() as connection:
+            baseline = connection.execute(
+                select(users).where(users.c.id == user_id)
+            ).mappings().one()
+        baseline_hash = str(baseline["password_hash"])
+        baseline_version = int(baseline["version"])
+
+        with pytest.raises(InvalidInvitationError):
+            service.register_invited_user(
+                token=second.token,
+                email=email,
+                display_name="Untrusted Replacement",
+                password="wrong existing password",
+                now=datetime(2026, 8, 24, 10, 3, tzinfo=UTC),
+            )
+        accepted = service.register_invited_user(
+            token=second.token,
+            email=email,
+            display_name="Ignored Replacement",
+            password="existing account password",
+            now=datetime(2026, 8, 24, 10, 4, tzinfo=UTC),
+        )
+        assert accepted.organization_id == organization_ids[1]
+        assert accepted.display_name == "Canonical Multi-Org User"
+
+        third = service.issue_invitation(
+            organization_id=organization_ids[2],
+            email=email,
+            actor=AuditActor.system(organization_ids[2]),
+            now=datetime(2026, 8, 24, 10, 5, tzinfo=UTC),
+        )
+        assert third.user_id == user_id
+
+        with engine.connect() as connection:
+            preserved = connection.execute(
+                select(users).where(users.c.id == user_id)
+            ).mappings().one()
+            membership_rows = connection.execute(
+                select(
+                    organization_memberships.c.organization_id,
+                    organization_memberships.c.status,
+                ).where(organization_memberships.c.user_id == user_id)
+            ).all()
+        assert preserved["password_hash"] == baseline_hash
+        assert preserved["display_name"] == "Canonical Multi-Org User"
+        assert preserved["auth_version"] == 2
+        assert preserved["version"] == baseline_version
+        assert set(membership_rows) == {
+            (organization_ids[0], "active"),
+            (organization_ids[1], "active"),
+            (organization_ids[2], "invited"),
+        }
+    finally:
+        with engine.begin() as connection:
+            connection.execute(
+                audit_events.delete().where(
+                    audit_events.c.organization_id.in_(organization_ids)
+                )
+            )
+            connection.execute(
+                organizations.delete().where(
+                    organizations.c.id.in_(organization_ids)
+                )
+            )
+            connection.execute(
+                users.delete().where(users.c.email_normalized == email)
+            )
+        engine.dispose()
+
+
+@requires_mysql
+def test_concurrent_cross_organization_invites_converge_on_one_global_user() -> None:
+    settings = get_settings()
+    engine = create_engine(settings.mysql_url(), pool_pre_ping=True)
+    repository = IdentityRepository(settings=settings, engine=engine)
+    service = InvitationRegistrationService(
+        repository,
+        password_service=Argon2idPasswordService(
+            time_cost=1,
+            memory_cost_kib=8_192,
+            parallelism=1,
+        ),
+    )
+    organization_ids = (str(uuid4()), str(uuid4()))
+    email = f"concurrent-{uuid4()}@example.invalid"
+    barrier = Barrier(2)
+    user_id: str | None = None
+
+    try:
+        with engine.begin() as connection:
+            connection.execute(
+                organizations.insert(),
+                [
+                    {
+                        "id": organization_id,
+                        "name": f"Concurrent Invitation Test {index}",
+                        "slug": f"concurrent-invitation-{uuid4()}",
+                        "status": "active",
+                    }
+                    for index, organization_id in enumerate(
+                        organization_ids,
+                        start=1,
+                    )
+                ],
+            )
+
+        def issue(organization_id: str):
+            barrier.wait(timeout=10)
+            return service.issue_invitation(
+                organization_id=organization_id,
+                email=email,
+                actor=AuditActor.system(organization_id),
+                now=datetime(2026, 8, 24, 11, 0, tzinfo=UTC),
+            )
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            invitations = tuple(executor.map(issue, organization_ids))
+
+        user_id = invitations[0].user_id
+        assert {invitation.user_id for invitation in invitations} == {user_id}
+        assert len({invitation.membership_id for invitation in invitations}) == 2
+        with engine.connect() as connection:
+            assert connection.execute(
+                select(func.count()).select_from(users).where(
+                    users.c.email_normalized == email
+                )
+            ).scalar_one() == 1
+            assert connection.execute(
+                select(func.count())
+                .select_from(organization_memberships)
+                .where(
+                    organization_memberships.c.user_id == user_id,
+                    organization_memberships.c.status == "invited",
+                )
+            ).scalar_one() == 2
+            assert connection.execute(
+                select(func.count()).select_from(one_time_tokens).where(
+                    one_time_tokens.c.user_id == user_id,
+                    one_time_tokens.c.consumed_at.is_(None),
+                )
+            ).scalar_one() == 2
+    finally:
+        with engine.begin() as connection:
+            connection.execute(
+                audit_events.delete().where(
+                    audit_events.c.organization_id.in_(organization_ids)
+                )
+            )
+            connection.execute(
+                organizations.delete().where(
+                    organizations.c.id.in_(organization_ids)
+                )
+            )
+            connection.execute(
+                users.delete().where(users.c.email_normalized == email)
+            )
+        engine.dispose()
+
+
+@requires_mysql
+def test_concurrent_first_acceptance_is_retryable_without_identity_overwrite() -> None:
+    settings = get_settings()
+    engine = create_engine(settings.mysql_url(), pool_pre_ping=True)
+    repository = IdentityRepository(settings=settings, engine=engine)
+    password_service = Argon2idPasswordService(
+        time_cost=1,
+        memory_cost_kib=8_192,
+        parallelism=1,
+    )
+    issuing_service = InvitationRegistrationService(
+        repository,
+        password_service=password_service,
+    )
+    organization_ids = (str(uuid4()), str(uuid4()))
+    email = f"concurrent-accept-{uuid4()}@example.invalid"
+    user_id: str | None = None
+
+    try:
+        with engine.begin() as connection:
+            connection.execute(
+                organizations.insert(),
+                [
+                    {
+                        "id": organization_id,
+                        "name": f"Concurrent Acceptance Test {index}",
+                        "slug": f"concurrent-acceptance-{uuid4()}",
+                        "status": "active",
+                    }
+                    for index, organization_id in enumerate(
+                        organization_ids,
+                        start=1,
+                    )
+                ],
+            )
+        invitations = tuple(
+            issuing_service.issue_invitation(
+                organization_id=organization_id,
+                email=email,
+                actor=AuditActor.system(organization_id),
+                now=datetime(2026, 8, 24, 12, index, tzinfo=UTC),
+            )
+            for index, organization_id in enumerate(organization_ids)
+        )
+        user_id = invitations[0].user_id
+        challenge_barrier = Barrier(2)
+
+        class BarrierAcceptanceRepository:
+            def find_invitation_registration_challenge(self, **kwargs):
+                challenge = repository.find_invitation_registration_challenge(
+                    **kwargs
+                )
+                challenge_barrier.wait(timeout=10)
+                return challenge
+
+            def consume_user_invitation(self, plan):
+                return repository.consume_user_invitation(plan)
+
+        acceptance_services = tuple(
+            InvitationRegistrationService(
+                BarrierAcceptanceRepository(),  # type: ignore[arg-type]
+                password_service=password_service,
+            )
+            for _ in invitations
+        )
+        submitted_names = ("Concurrent Candidate One", "Concurrent Candidate Two")
+
+        def accept(index: int):
+            try:
+                result = acceptance_services[index].register_invited_user(
+                    token=invitations[index].token,
+                    email=email,
+                    display_name=submitted_names[index],
+                    password="shared concurrent password",
+                    now=datetime(2026, 8, 24, 12, 5, tzinfo=UTC),
+                )
+                return "success", result
+            except InvalidInvitationError as exc:
+                return "invalid", exc
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            outcomes = tuple(executor.map(accept, range(2)))
+
+        assert [outcome[0] for outcome in outcomes].count("success") == 1
+        assert [outcome[0] for outcome in outcomes].count("invalid") == 1
+        winner_index = next(
+            index for index, outcome in enumerate(outcomes) if outcome[0] == "success"
+        )
+        loser_index = 1 - winner_index
+        winner_result = outcomes[winner_index][1]
+
+        retried = issuing_service.register_invited_user(
+            token=invitations[loser_index].token,
+            email=email,
+            display_name="Retry Must Not Replace Identity",
+            password="shared concurrent password",
+            now=datetime(2026, 8, 24, 12, 6, tzinfo=UTC),
+        )
+
+        assert retried.display_name == winner_result.display_name
+        assert retried.display_name == submitted_names[winner_index]
+        with engine.connect() as connection:
+            preserved_user = connection.execute(
+                select(users).where(users.c.id == user_id)
+            ).mappings().one()
+            membership_statuses = connection.execute(
+                select(organization_memberships.c.status).where(
+                    organization_memberships.c.user_id == user_id
+                )
+            ).scalars().all()
+            consumed_count = connection.execute(
+                select(func.count()).select_from(one_time_tokens).where(
+                    one_time_tokens.c.user_id == user_id,
+                    one_time_tokens.c.consumed_at.is_not(None),
+                )
+            ).scalar_one()
+        assert preserved_user["display_name"] == submitted_names[winner_index]
+        assert preserved_user["auth_version"] == 2
+        assert preserved_user["version"] == 2
+        assert password_service.verify_password(
+            str(preserved_user["password_hash"]),
+            "shared concurrent password",
+        )
+        assert sorted(membership_statuses) == ["active", "active"]
+        assert consumed_count == 2
+    finally:
+        with engine.begin() as connection:
+            connection.execute(
+                audit_events.delete().where(
+                    audit_events.c.organization_id.in_(organization_ids)
+                )
+            )
+            connection.execute(
+                organizations.delete().where(
+                    organizations.c.id.in_(organization_ids)
+                )
+            )
+            connection.execute(
+                users.delete().where(users.c.email_normalized == email)
+            )
         engine.dispose()

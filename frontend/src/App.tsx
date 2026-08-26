@@ -6,10 +6,16 @@ import {
   AppBar,
   Box,
   Button,
+  Checkbox,
   Chip,
   CircularProgress,
   CssBaseline,
+  Dialog,
+  DialogActions,
+  DialogContent,
+  DialogTitle,
   Divider,
+  FormControlLabel,
   IconButton,
   List,
   ListItemButton,
@@ -37,6 +43,8 @@ import SchemaIcon from '@mui/icons-material/Schema';
 import SmartToyIcon from '@mui/icons-material/SmartToy';
 import QueryStatsIcon from '@mui/icons-material/QueryStats';
 import TableRowsIcon from '@mui/icons-material/TableRows';
+import ManageAccountsIcon from '@mui/icons-material/ManageAccounts';
+import DashboardIcon from '@mui/icons-material/Dashboard';
 import {
   ApiError,
   ask,
@@ -46,14 +54,25 @@ import {
   getSchema,
   isAuthenticationDisabled,
   login,
+  issueAdminInvitation,
+  listAdminFacilities,
+  listAdminMembers,
+  listAdminRoles,
   logout,
   registerAccount,
+  replaceAdminMemberFacilityScope,
+  replaceAdminMemberRoles,
   runQuerySpec,
+  syncAdminFacilities,
+  updateAdminMemberStatus,
 } from './api';
 import { theme } from './theme';
 import type {
   AgentInsight,
   AgentIntent,
+  AdminFacility,
+  AdminMember,
+  AdminRole,
   AskPayload,
   AuthSession,
   ChartSpec,
@@ -67,6 +86,7 @@ import type {
 
 type AuthStatus = 'checking' | 'authenticated' | 'anonymous' | 'unauthenticated' | 'error';
 type AuthFieldError = { field: string; message: string };
+type AppView = 'workbench' | 'administration';
 
 const defaultQuestion = '2021年50到69岁和70岁以上患者的平均总费用是多少，按年龄组排序';
 const sampleSpec = {
@@ -98,6 +118,7 @@ export function App() {
   const [authFieldErrors, setAuthFieldErrors] = useState<AuthFieldError[]>([]);
   const [authNotice, setAuthNotice] = useState<string | null>(null);
   const [authLoading, setAuthLoading] = useState(false);
+  const [activeView, setActiveView] = useState<AppView>('workbench');
   const [health, setHealth] = useState<HealthPayload | null>(null);
   const [schema, setSchema] = useState<SchemaPayload | null>(null);
   const [distinct, setDistinct] = useState<DistinctPayload | null>(null);
@@ -110,6 +131,11 @@ export function App() {
   const canAccessWorkbench =
     authStatus === 'anonymous' ||
     (authStatus === 'authenticated' && session?.permissions.includes('analytics.schema.read') === true);
+  const canManageUsers = session?.permissions.includes('users.manage') === true;
+  const canAssignRoles = session?.permissions.includes('roles.assign') === true;
+  const canCreateImports = session?.permissions.includes('imports.create') === true;
+  const canAccessAdministration =
+    authStatus === 'authenticated' && (canManageUsers || canAssignRoles || canCreateImports);
 
   const reportRequestFailure = useCallback((err: unknown) => {
     if (err instanceof ApiError && err.status === 401) {
@@ -138,6 +164,9 @@ export function App() {
     try {
       const activeSession = await getCurrentSession();
       setSession(activeSession);
+      setActiveView(
+        activeSession.permissions.includes('analytics.schema.read') ? 'workbench' : 'administration',
+      );
       setAuthStatus('authenticated');
     } catch (err) {
       setSession(null);
@@ -155,15 +184,20 @@ export function App() {
     }
   }, []);
 
+  const refreshCurrentSession = useCallback(async () => {
+    const activeSession = await getCurrentSession();
+    setSession(activeSession);
+  }, []);
+
   useEffect(() => {
     void restoreAuthentication();
   }, [restoreAuthentication]);
 
   useEffect(() => {
-    if (canAccessWorkbench) {
+    if (canAccessWorkbench && activeView === 'workbench') {
       void loadBasics();
     }
-  }, [canAccessWorkbench, loadBasics]);
+  }, [activeView, canAccessWorkbench, loadBasics]);
 
   const handleLogin = async (email: string, password: string, organizationId: string) => {
     setAuthLoading(true);
@@ -178,6 +212,9 @@ export function App() {
         ...(organizationId.trim() ? { organization_id: organizationId.trim() } : {}),
       });
       setSession(activeSession);
+      setActiveView(
+        activeSession.permissions.includes('analytics.schema.read') ? 'workbench' : 'administration',
+      );
       setAuthStatus('authenticated');
     } catch (err) {
       setAuthError(err instanceof Error ? err.message : String(err));
@@ -187,20 +224,20 @@ export function App() {
     }
   };
 
-  const handleRegistration = async (credentials: RegistrationCredentials): Promise<boolean> => {
+  const handleRegistration = async (credentials: RegistrationCredentials): Promise<string | null> => {
     setAuthLoading(true);
     setAuthError(null);
     setAuthFieldErrors([]);
     setAuthNotice(null);
     setError(null);
     try {
-      await registerAccount(credentials);
-      setAuthNotice('注册成功，请使用新账号登录。数据权限需要由组织管理员另行分配。');
-      return true;
+      const result = await registerAccount(credentials);
+      setAuthNotice('邀请已接受，请使用该账号登录。组织 ID 已自动填写，数据权限由组织管理员分配。');
+      return result.organization_id;
     } catch (err) {
       setAuthError(err instanceof Error ? err.message : String(err));
       setAuthFieldErrors(err instanceof ApiError ? err.fieldErrors : []);
-      return false;
+      return null;
     } finally {
       setAuthLoading(false);
     }
@@ -223,6 +260,7 @@ export function App() {
       setDistinct(null);
       setAskResult(null);
       setQueryResult(null);
+      setActiveView('workbench');
       setAuthStatus('unauthenticated');
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -305,6 +343,28 @@ export function App() {
                       variant="outlined"
                       label={`${session.user.display_name || session.user.email} · ${session.organization.name}`}
                     />
+                    {canAccessWorkbench ? (
+                      <Button
+                        size="small"
+                        color="inherit"
+                        startIcon={<DashboardIcon />}
+                        variant={activeView === 'workbench' ? 'outlined' : 'text'}
+                        onClick={() => setActiveView('workbench')}
+                      >
+                        工作台
+                      </Button>
+                    ) : null}
+                    {canAccessAdministration ? (
+                      <Button
+                        size="small"
+                        color="inherit"
+                        startIcon={<ManageAccountsIcon />}
+                        variant={activeView === 'administration' ? 'outlined' : 'text'}
+                        onClick={() => setActiveView('administration')}
+                      >
+                        管理
+                      </Button>
+                    ) : null}
                     <Button size="small" color="inherit" onClick={() => void handleLogout()} disabled={authLoading}>
                       退出
                     </Button>
@@ -312,11 +372,13 @@ export function App() {
                 ) : (
                   <Chip size="small" variant="outlined" label="匿名开发模式" />
                 )}
-                <Tooltip title="Refresh">
-                  <IconButton size="small" onClick={() => void loadBasics()}>
-                    <RefreshIcon fontSize="small" />
-                  </IconButton>
-                </Tooltip>
+                {activeView === 'workbench' && canAccessWorkbench ? (
+                  <Tooltip title="Refresh">
+                    <IconButton size="small" onClick={() => void loadBasics()}>
+                      <RefreshIcon fontSize="small" />
+                    </IconButton>
+                  </Tooltip>
+                ) : null}
               </Stack>
             ) : null}
           </Toolbar>
@@ -345,6 +407,15 @@ export function App() {
             onLogin={handleLogin}
             onRegister={handleRegistration}
             onModeChange={clearAuthFeedback}
+          />
+        ) : authStatus === 'authenticated' && activeView === 'administration' && canAccessAdministration ? (
+          <AdministrationPanel
+            session={session}
+            canManageUsers={canManageUsers}
+            canAssignRoles={canAssignRoles}
+            canCreateImports={canCreateImports}
+            onAuthenticationLost={reportRequestFailure}
+            onSessionChanged={refreshCurrentSession}
           />
         ) : authStatus === 'authenticated' && !canAccessWorkbench ? (
           <AccessPendingPanel session={session} />
@@ -530,6 +601,570 @@ function AccessPendingPanel({ session }: { session: AuthSession | null }) {
   );
 }
 
+function AdministrationPanel({
+  session,
+  canManageUsers,
+  canAssignRoles,
+  canCreateImports,
+  onAuthenticationLost,
+  onSessionChanged,
+}: {
+  session: AuthSession | null;
+  canManageUsers: boolean;
+  canAssignRoles: boolean;
+  canCreateImports: boolean;
+  onAuthenticationLost: (error: unknown) => void;
+  onSessionChanged: () => Promise<void>;
+}) {
+  const [members, setMembers] = useState<AdminMember[]>([]);
+  const [roles, setRoles] = useState<AdminRole[]>([]);
+  const [facilities, setFacilities] = useState<AdminFacility[]>([]);
+  const [selectedMember, setSelectedMember] = useState<AdminMember | null>(null);
+  const [statusMember, setStatusMember] = useState<AdminMember | null>(null);
+  const [selectedRoleIds, setSelectedRoleIds] = useState<string[]>([]);
+  const [selectedFacilityIds, setSelectedFacilityIds] = useState<string[]>([]);
+  const [invitationEmail, setInvitationEmail] = useState('');
+  const [invitationHours, setInvitationHours] = useState('24');
+  const [issuedInvitation, setIssuedInvitation] = useState<{
+    token: string;
+    expiresAt: string;
+  } | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+  const canViewMembers = canManageUsers || canAssignRoles;
+
+  const handleError = useCallback(
+    (cause: unknown) => {
+      if (cause instanceof ApiError && cause.status === 401) {
+        onAuthenticationLost(cause);
+      }
+      setError(cause instanceof Error ? cause.message : String(cause));
+    },
+    [onAuthenticationLost],
+  );
+
+  const loadAdministration = useCallback(async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const [memberItems, roleItems, facilityItems] = await Promise.all([
+        canViewMembers ? collectAdminPages(listAdminMembers) : Promise.resolve([]),
+        canAssignRoles ? collectAdminPages(listAdminRoles) : Promise.resolve([]),
+        canAssignRoles || canCreateImports
+          ? collectAdminPages(listAdminFacilities)
+          : Promise.resolve([]),
+      ]);
+      setMembers(memberItems);
+      setRoles(roleItems);
+      setFacilities(facilityItems);
+    } catch (cause) {
+      handleError(cause);
+    } finally {
+      setLoading(false);
+    }
+  }, [canAssignRoles, canCreateImports, canViewMembers, handleError]);
+
+  useEffect(() => {
+    void loadAdministration();
+  }, [loadAdministration]);
+
+  const openMember = (member: AdminMember) => {
+    setSelectedMember(member);
+    setSelectedRoleIds(member.roles.map((role) => role.id));
+    setSelectedFacilityIds(member.facilities.map((facility) => facility.id));
+    setError(null);
+    setNotice(null);
+  };
+
+  const updateMemberInList = (member: AdminMember) => {
+    setMembers((current) =>
+      current.map((item) => (item.membership_id === member.membership_id ? member : item)),
+    );
+  };
+
+  const saveMemberAccess = async () => {
+    if (!selectedMember || !canAssignRoles) return;
+    const isCurrentMember =
+      selectedMember.membership_id === session?.organization.membership_id;
+    let accessChanged = false;
+    setSaving(true);
+    setError(null);
+    setNotice(null);
+    try {
+      let updated = selectedMember;
+      const currentRoleIds = updated.roles.map((role) => role.id);
+      if (!sameIdentifierSet(currentRoleIds, selectedRoleIds)) {
+        updated = await replaceAdminMemberRoles(
+          updated.membership_id,
+          selectedRoleIds,
+          updated.version,
+        );
+        updateMemberInList(updated);
+        setSelectedMember(updated);
+        accessChanged = true;
+      }
+      const currentFacilityIds = updated.facilities.map((facility) => facility.id);
+      if (!sameIdentifierSet(currentFacilityIds, selectedFacilityIds)) {
+        updated = await replaceAdminMemberFacilityScope(
+          updated.membership_id,
+          selectedFacilityIds,
+          updated.version,
+        );
+        updateMemberInList(updated);
+        accessChanged = true;
+      }
+      setNotice(`已更新 ${updated.display_name || updated.email} 的角色和机构范围。`);
+      setSelectedMember(null);
+      if (accessChanged && isCurrentMember) {
+        await onSessionChanged();
+      }
+    } catch (cause) {
+      await loadAdministration();
+      let sessionRefreshFailure: unknown = null;
+      if (accessChanged && isCurrentMember) {
+        try {
+          await onSessionChanged();
+        } catch (refreshCause) {
+          sessionRefreshFailure = refreshCause;
+        }
+      }
+      if (accessChanged && !(cause instanceof ApiError && cause.status === 401)) {
+        if (sessionRefreshFailure instanceof ApiError && sessionRefreshFailure.status === 401) {
+          handleError(sessionRefreshFailure);
+          return;
+        }
+        setSelectedMember(null);
+        const message = cause instanceof Error ? cause.message : String(cause);
+        const refreshMessage = sessionRefreshFailure
+          ? `；当前会话刷新失败：${
+              sessionRefreshFailure instanceof Error
+                ? sessionRefreshFailure.message
+                : String(sessionRefreshFailure)
+            }`
+          : '';
+        setError(`部分权限变更可能已提交，机构范围未确认完成：${message}${refreshMessage}`);
+      } else {
+        handleError(cause);
+      }
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const changeMemberStatus = async (member: AdminMember) => {
+    if (
+      !canManageUsers ||
+      (member.membership_status !== 'active' && member.membership_status !== 'suspended')
+    ) return;
+    const nextStatus = member.membership_status === 'active' ? 'suspended' : 'active';
+    setSaving(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const updated = await updateAdminMemberStatus(
+        member.membership_id,
+        nextStatus,
+        member.version,
+      );
+      updateMemberInList(updated);
+      setNotice(nextStatus === 'active' ? '成员已恢复。' : '成员已停用，现有会话已失效。');
+      setStatusMember(null);
+    } catch (cause) {
+      handleError(cause);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const issueInvitation = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!canManageUsers || !invitationEmail.trim()) return;
+    setSaving(true);
+    setError(null);
+    setNotice(null);
+    setIssuedInvitation(null);
+    try {
+      const hours = Number(invitationHours);
+      const invitation = await issueAdminInvitation(
+        invitationEmail,
+        Number.isFinite(hours) ? hours : 24,
+      );
+      setIssuedInvitation({ token: invitation.token, expiresAt: invitation.expires_at });
+      setInvitationEmail('');
+      setNotice('邀请已创建。请立即通过受信任渠道发送，关闭后无法再次查看原令牌。');
+      await loadAdministration();
+    } catch (cause) {
+      handleError(cause);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const syncFacilities = async () => {
+    if (!canCreateImports && !canAssignRoles) return;
+    setSaving(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const result = await syncAdminFacilities();
+      setNotice(
+        `机构目录同步完成：新增 ${result.created_count} 个，已有 ${result.existing_count} 个。`,
+      );
+      const facilityItems = await collectAdminPages(listAdminFacilities);
+      setFacilities(facilityItems);
+    } catch (cause) {
+      handleError(cause);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <Box component="main" sx={{ flex: 1, minHeight: 0, p: 2 }}>
+      <Stack spacing={2} sx={{ maxWidth: 1500, mx: 'auto' }}>
+        <Paper sx={{ p: 2 }}>
+          <Stack
+            direction={{ xs: 'column', md: 'row' }}
+            alignItems={{ xs: 'flex-start', md: 'center' }}
+            justifyContent="space-between"
+            gap={2}
+          >
+            <Box>
+              <Typography variant="h2">组织管理</Typography>
+              <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
+                {session?.organization.name} · 用户、角色和机构数据范围
+              </Typography>
+            </Box>
+            <Stack direction="row" spacing={1}>
+              {(canCreateImports || canAssignRoles) ? (
+                <Button
+                  variant="outlined"
+                  startIcon={<StorageIcon />}
+                  onClick={() => void syncFacilities()}
+                  disabled={saving}
+                >
+                  同步机构目录
+                </Button>
+              ) : null}
+              <Button
+                variant="outlined"
+                startIcon={<RefreshIcon />}
+                onClick={() => void loadAdministration()}
+                disabled={loading || saving}
+              >
+                刷新
+              </Button>
+            </Stack>
+          </Stack>
+        </Paper>
+
+        {error ? <Alert severity="error">{error}</Alert> : null}
+        {notice ? <Alert severity="success">{notice}</Alert> : null}
+        {issuedInvitation ? (
+          <Alert severity="warning">
+            <Typography variant="body2" fontWeight={700}>
+              一次性邀请码（有效至 {formatDateTime(issuedInvitation.expiresAt)}）
+            </Typography>
+            <Typography
+              component="code"
+              sx={{ display: 'block', mt: 1, overflowWrap: 'anywhere', userSelect: 'all' }}
+            >
+              {issuedInvitation.token}
+            </Typography>
+          </Alert>
+        ) : null}
+
+        {canManageUsers ? (
+          <Paper component="form" onSubmit={issueInvitation} sx={{ p: 2 }}>
+            <Typography variant="h2">邀请成员</Typography>
+            <Stack direction={{ xs: 'column', md: 'row' }} spacing={1.5} sx={{ mt: 1.5 }}>
+              <TextField
+                label="邮箱"
+                type="email"
+                value={invitationEmail}
+                onChange={(event) => setInvitationEmail(event.target.value)}
+                required
+                fullWidth
+              />
+              <TextField
+                label="有效小时数"
+                type="number"
+                value={invitationHours}
+                onChange={(event) => setInvitationHours(event.target.value)}
+                inputProps={{ min: 1, max: 168 }}
+                sx={{ width: { xs: '100%', md: 180 } }}
+              />
+              <Button
+                type="submit"
+                variant="contained"
+                disabled={saving || !invitationEmail.trim()}
+                sx={{ minWidth: 130 }}
+              >
+                创建邀请
+              </Button>
+            </Stack>
+          </Paper>
+        ) : null}
+
+        {canViewMembers ? <Paper sx={{ overflow: 'hidden' }}>
+          <Box sx={{ p: 2, pb: 1 }}>
+            <Typography variant="h2">成员</Typography>
+            <Typography variant="caption" color="text.secondary">
+              共 {members.length} 个；空机构范围表示禁止访问任何医疗数据。
+            </Typography>
+          </Box>
+          {loading ? (
+            <Box sx={{ display: 'grid', placeItems: 'center', minHeight: 220 }}>
+              <CircularProgress size={28} />
+            </Box>
+          ) : (
+            <TableContainer sx={{ maxHeight: 'calc(100vh - 390px)' }}>
+              <Table stickyHeader size="small">
+                <TableHead>
+                  <TableRow>
+                    <TableCell>用户</TableCell>
+                    <TableCell>状态</TableCell>
+                    <TableCell>角色</TableCell>
+                    <TableCell>机构范围</TableCell>
+                    <TableCell align="right">操作</TableCell>
+                  </TableRow>
+                </TableHead>
+                <TableBody>
+                  {members.map((member) => (
+                    <TableRow key={member.membership_id} hover>
+                      <TableCell>
+                        <Typography variant="body2" fontWeight={700}>
+                          {member.display_name || '未激活成员'}
+                        </Typography>
+                        <Typography variant="caption" color="text.secondary">
+                          {member.email}
+                        </Typography>
+                      </TableCell>
+                      <TableCell>
+                        <Chip
+                          size="small"
+                          label={memberStatusLabel(member.membership_status)}
+                          color={member.membership_status === 'active' ? 'success' : 'default'}
+                          variant={member.membership_status === 'active' ? 'filled' : 'outlined'}
+                        />
+                      </TableCell>
+                      <TableCell>
+                        <Stack direction="row" gap={0.5} flexWrap="wrap">
+                          {member.roles.length ? member.roles.map((role) => (
+                            <Chip key={role.id} size="small" label={role.name} />
+                          )) : <Typography variant="caption" color="text.secondary">未分配</Typography>}
+                        </Stack>
+                      </TableCell>
+                      <TableCell>
+                        <Typography variant="body2">
+                          {member.facilities.length ? `${member.facilities.length} 个机构` : '禁止访问'}
+                        </Typography>
+                      </TableCell>
+                      <TableCell align="right">
+                        <Stack direction="row" spacing={0.75} justifyContent="flex-end">
+                          {canAssignRoles ? (
+                            <Button size="small" onClick={() => openMember(member)} disabled={saving}>
+                              配置权限
+                            </Button>
+                          ) : null}
+                          {member.membership_id === session?.organization.membership_id ? (
+                            <Chip size="small" variant="outlined" label="当前账号" />
+                          ) : canManageUsers && ['active', 'suspended'].includes(member.membership_status) ? (
+                            <Button
+                              size="small"
+                              color={member.membership_status === 'active' ? 'error' : 'primary'}
+                              onClick={() => setStatusMember(member)}
+                              disabled={saving}
+                            >
+                              {member.membership_status === 'active' ? '停用' : '恢复'}
+                            </Button>
+                          ) : null}
+                        </Stack>
+                      </TableCell>
+                    </TableRow>
+                  ))}
+                  {!members.length ? (
+                    <TableRow>
+                      <TableCell colSpan={5} align="center" sx={{ py: 6, color: 'text.secondary' }}>
+                        暂无组织成员
+                      </TableCell>
+                    </TableRow>
+                  ) : null}
+                </TableBody>
+              </Table>
+            </TableContainer>
+          )}
+        </Paper> : null}
+      </Stack>
+
+      <Dialog
+        open={selectedMember !== null}
+        onClose={() => !saving && setSelectedMember(null)}
+        fullWidth
+        maxWidth="md"
+      >
+        <DialogTitle>
+          配置 {selectedMember?.display_name || selectedMember?.email || '成员'}
+        </DialogTitle>
+        <DialogContent dividers>
+          <Stack spacing={2.5}>
+            <Box>
+              <Typography variant="body2" fontWeight={700}>角色</Typography>
+              <Stack direction="row" flexWrap="wrap" gap={0.5} sx={{ mt: 0.75 }}>
+                {roles.map((role) => (
+                  <FormControlLabel
+                    key={role.id}
+                    control={(
+                      <Checkbox
+                        checked={selectedRoleIds.includes(role.id)}
+                        onChange={() => setSelectedRoleIds((current) => toggleIdentifier(current, role.id))}
+                      />
+                    )}
+                    label={role.name}
+                  />
+                ))}
+              </Stack>
+            </Box>
+            <Divider />
+            <Box>
+              <Stack direction="row" alignItems="center" justifyContent="space-between" gap={1}>
+                <Box>
+                  <Typography variant="body2" fontWeight={700}>允许访问的机构</Typography>
+                  <Typography variant="caption" color="text.secondary">
+                    未勾选任何机构时，该成员不能执行医疗数据查询。
+                  </Typography>
+                </Box>
+                {facilities.length ? (
+                  <Stack direction="row" spacing={0.5}>
+                    <Button
+                      size="small"
+                      onClick={() => setSelectedFacilityIds(
+                        facilities
+                          .filter((facility) => facility.status === 'active')
+                          .map((facility) => facility.id),
+                      )}
+                    >
+                      全部选择
+                    </Button>
+                    <Button size="small" onClick={() => setSelectedFacilityIds([])}>
+                      清空
+                    </Button>
+                  </Stack>
+                ) : null}
+              </Stack>
+              <Box sx={{ mt: 1, maxHeight: 330, overflow: 'auto', display: 'grid', gridTemplateColumns: { xs: '1fr', md: '1fr 1fr' } }}>
+                {facilities.map((facility) => (
+                  <FormControlLabel
+                    key={facility.id}
+                    control={(
+                      <Checkbox
+                        checked={selectedFacilityIds.includes(facility.id)}
+                        disabled={
+                          facility.status !== 'active' &&
+                          !selectedFacilityIds.includes(facility.id)
+                        }
+                        onChange={() => setSelectedFacilityIds((current) => toggleIdentifier(current, facility.id))}
+                      />
+                    )}
+                    label={`${facility.display_name || facility.facility_key} (${facility.facility_key})${
+                      facility.status === 'active' ? '' : '（已停用）'
+                    }`}
+                  />
+                ))}
+                {!facilities.length ? (
+                  <Alert severity="info" sx={{ gridColumn: '1 / -1' }}>
+                    机构目录为空，请先点击“同步机构目录”。
+                  </Alert>
+                ) : null}
+              </Box>
+            </Box>
+          </Stack>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setSelectedMember(null)} disabled={saving}>取消</Button>
+          <Button variant="contained" onClick={() => void saveMemberAccess()} disabled={saving}>
+            {saving ? <CircularProgress size={18} color="inherit" /> : '保存权限'}
+          </Button>
+        </DialogActions>
+      </Dialog>
+
+      <Dialog
+        open={statusMember !== null}
+        onClose={() => !saving && setStatusMember(null)}
+        fullWidth
+        maxWidth="xs"
+      >
+        <DialogTitle>
+          {statusMember?.membership_status === 'active' ? '确认停用成员' : '确认恢复成员'}
+        </DialogTitle>
+        <DialogContent>
+          <Typography variant="body2">
+            {statusMember?.membership_status === 'active'
+              ? `停用 ${statusMember.display_name || statusMember.email} 后，其现有会话会立即失效，且无法访问组织数据。`
+              : `恢复 ${statusMember?.display_name || statusMember?.email} 的组织成员资格？`}
+          </Typography>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setStatusMember(null)} disabled={saving}>取消</Button>
+          <Button
+            variant="contained"
+            color={statusMember?.membership_status === 'active' ? 'error' : 'primary'}
+            onClick={() => statusMember && void changeMemberStatus(statusMember)}
+            disabled={saving}
+          >
+            {saving ? <CircularProgress size={18} color="inherit" /> : '确认'}
+          </Button>
+        </DialogActions>
+      </Dialog>
+    </Box>
+  );
+}
+
+async function collectAdminPages<T>(
+  loader: (cursor?: string) => Promise<{ items: T[]; next_cursor: string | null }>,
+): Promise<T[]> {
+  const items: T[] = [];
+  let cursor: string | undefined;
+  for (let page = 0; page < 20; page += 1) {
+    const payload = await loader(cursor);
+    items.push(...payload.items);
+    if (!payload.next_cursor) return items;
+    cursor = payload.next_cursor;
+  }
+  throw new ApiError({
+    status: 500,
+    code: 'ADMIN_PAGINATION_LIMIT',
+    message: '管理数据页数超过当前界面上限，请缩小查询范围',
+  });
+}
+
+function toggleIdentifier(current: string[], value: string): string[] {
+  return current.includes(value) ? current.filter((item) => item !== value) : [...current, value];
+}
+
+function sameIdentifierSet(left: string[], right: string[]): boolean {
+  if (left.length !== right.length) return false;
+  const normalized = new Set(left);
+  return right.every((value) => normalized.has(value));
+}
+
+function memberStatusLabel(status: AdminMember['membership_status']): string {
+  const labels: Record<AdminMember['membership_status'], string> = {
+    invited: '待注册',
+    active: '正常',
+    suspended: '已停用',
+    removed: '已移除',
+  };
+  return labels[status];
+}
+
+function formatDateTime(value: string): string {
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) ? value : parsed.toLocaleString();
+}
+
 function AuthenticationPanel({
   loading,
   error,
@@ -544,7 +1179,7 @@ function AuthenticationPanel({
   fieldErrors: AuthFieldError[];
   notice: string | null;
   onLogin: (email: string, password: string, organizationId: string) => Promise<void>;
-  onRegister: (credentials: RegistrationCredentials) => Promise<boolean>;
+  onRegister: (credentials: RegistrationCredentials) => Promise<string | null>;
   onModeChange: () => void;
 }) {
   const [mode, setMode] = useState<'login' | 'register'>('login');
@@ -583,19 +1218,19 @@ function AuthenticationPanel({
       setClientError('两次输入的密码不一致。');
       return;
     }
-    const registered = await onRegister({
+    const registeredOrganizationId = await onRegister({
       invitation_token: invitationToken,
       email,
       display_name: displayName,
       password,
     });
-    if (registered) {
+    if (registeredOrganizationId) {
       setMode('login');
       setInvitationToken('');
       setDisplayName('');
       setPassword('');
       setPasswordConfirmation('');
-      setOrganizationId('');
+      setOrganizationId(registeredOrganizationId);
     }
   };
 
@@ -663,6 +1298,7 @@ function AuthenticationPanel({
               autoComplete="name"
               required
               fullWidth
+              helperText="首次激活时使用该名称；已有账号加入新组织时保持原名称。"
             />
           ) : null}
           <TextField

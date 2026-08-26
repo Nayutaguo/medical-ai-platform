@@ -56,14 +56,20 @@ def create_registration():
             normalized_account=normalize_email(email),
         )
 
-    invitation_registration_service().register_invited_user(
+    registration = invitation_registration_service().register_invited_user(
         token=invitation_token,
         email=email,
         display_name=display_name,
         password=password,
         request_id=current_request_id(),
     )
-    return success_response({"registered": True}, status=201)
+    return success_response(
+        {
+            "registered": True,
+            "organization_id": registration.organization_id,
+        },
+        status=201,
+    )
 
 
 @auth_api.post("/sessions")
@@ -96,16 +102,18 @@ def create_session():
         password,
         organization_id=organization_id.strip() if isinstance(organization_id, str) else None,
     )
+    settings = _settings()
     response, status = success_response(
         {
             "session": issued.active_session.to_public_dict(),
             # CSRF proof is not an authentication credential. The raw session
             # token remains exclusively in the HttpOnly cookie.
             "csrf_token": issued.csrf_token,
+            "csrf_cookie_name": settings.auth_csrf_cookie_name,
+            "csrf_header_name": settings.auth_csrf_header_name,
         },
         status=201,
     )
-    settings = _settings()
     response.set_cookie(
         settings.auth_session_cookie_name,
         issued.session_token,
@@ -138,7 +146,14 @@ def current_session():
 
     _require_authentication_enabled()
     active = _service().resolve_session(_session_cookie())
-    response, status = success_response({"session": active.to_public_dict()})
+    settings = _settings()
+    response, status = success_response(
+        {
+            "session": active.to_public_dict(),
+            "csrf_cookie_name": settings.auth_csrf_cookie_name,
+            "csrf_header_name": settings.auth_csrf_header_name,
+        }
+    )
     response.headers["Cache-Control"] = "no-store"
     return response, status
 

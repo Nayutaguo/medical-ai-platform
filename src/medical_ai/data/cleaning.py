@@ -7,6 +7,8 @@ from decimal import Decimal, InvalidOperation
 from typing import Any
 
 # 原始 SPARCS 字段名到项目统一字段名的映射。
+SPARCS_SCHEMA_VERSION = "sparcs-inpatient-v1"
+
 RAW_TO_CANONICAL: dict[str, str] = {
     "Hospital Service Area": "HospitalServiceArea",
     "Hospital County": "HospitalCounty",
@@ -134,11 +136,15 @@ ED_MAP = {
 
 # 原始数据中表示数值缺失的特殊文本。
 NUMERIC_MISSING_VALUES = {"NA", "N/A", "NONE", "NULL", "UNKNOWN", "UNKN"}
+NEWBORN_ADMISSION_TYPE = "Newborn"
+DEFAULT_INVALID_SAMPLE_LIMIT = 50
 
 
 @dataclass
 class DataQualityProfile:
-    # 保存清洗结果的总体质量统计，不保存完整明细，避免额外占用大量内存。
+    """保存清洗质量统计，并对无效行样本使用固定内存上限。"""
+
+    invalid_sample_limit: int = DEFAULT_INVALID_SAMPLE_LIMIT
     row_count: int = 0
     null_counts: Counter[str] = field(default_factory=Counter)
     max_lengths: Counter[str] = field(default_factory=Counter)
@@ -147,7 +153,12 @@ class DataQualityProfile:
     )
     numeric_min: dict[str, Decimal | int] = field(default_factory=dict)
     numeric_max: dict[str, Decimal | int] = field(default_factory=dict)
-    invalid_rows: list[dict[str, Any]] = field(default_factory=list)
+    invalid_row_count: int = field(default=0, init=False)
+    invalid_rows: list[dict[str, Any]] = field(default_factory=list, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        if self.invalid_sample_limit < 0:
+            raise ValueError("invalid_sample_limit must be non-negative")
 
     def observe(self, row: Mapping[str, Any]) -> None:
         # 每处理一条有效记录，就更新空值、长度、分类分布和数值范围统计。
@@ -168,8 +179,12 @@ class DataQualityProfile:
                 self.numeric_max[column] = value if current_max is None or value > current_max else current_max
 
     def record_invalid_row(self, row_number: int, error: Exception) -> None:
-        # 只保留无效行的行号和错误原因，便于后续定位问题。
-        self.invalid_rows.append({"row_number": row_number, "error": str(error)})
+        """记录无效行总数与有界样本，不保存可能包含原始值的异常文本。"""
+
+        self.invalid_row_count += 1
+        if len(self.invalid_rows) >= self.invalid_sample_limit:
+            return
+        self.invalid_rows.append({"row_number": row_number, "error_code": _profile_error_code(error)})
 
     def to_dict(self, top_n: int = 20) -> dict[str, Any]:
         # 将 Decimal 等特殊类型转换为可写入 JSON 的普通值。
@@ -186,17 +201,21 @@ class DataQualityProfile:
             },
             "numeric_min": {column: _profile_value(value) for column, value in self.numeric_min.items()},
             "numeric_max": {column: _profile_value(value) for column, value in self.numeric_max.items()},
-            "invalid_row_count": len(self.invalid_rows),
-            "invalid_rows_sample": self.invalid_rows[:50],
+            "invalid_row_count": self.invalid_row_count,
+            "invalid_rows_sample": list(self.invalid_rows),
         }
 
 
 def clean_sparcs_row(row: Mapping[str, str]) -> dict[str, Any]:
     # 清洗单条原始记录：统一字段名、处理空值、转换类型并生成派生字段。
     cleaned: dict[str, Any] = {}
+    admission_type = _blank_to_none(row.get("Type of Admission", ""))
     for raw_name, canonical_name in RAW_TO_CANONICAL.items():
         value = _blank_to_none(row.get(raw_name, ""))
-        cleaned[canonical_name] = _clean_value(canonical_name, value)
+        if canonical_name == "BirthWeight" and admission_type != NEWBORN_ADMISSION_TYPE:
+            cleaned[canonical_name] = None
+        else:
+            cleaned[canonical_name] = _clean_value(canonical_name, value)
 
     # 根据 Race 和 Ethnicity 生成便于分析的组合字段。
     race = cleaned.get("Race")
@@ -300,3 +319,15 @@ def _profile_value(value: Any) -> Any:
     if isinstance(value, Decimal):
         return str(value)
     return value
+
+
+def _profile_error_code(error: Exception) -> str:
+    """将异常类型转为不含原始数据的稳定错误码。"""
+
+    name = error.__class__.__name__
+    parts: list[str] = []
+    for index, character in enumerate(name):
+        if index and character.isupper() and not name[index - 1].isupper():
+            parts.append("_")
+        parts.append(character.upper())
+    return "".join(parts) or "UNKNOWN_ERROR"

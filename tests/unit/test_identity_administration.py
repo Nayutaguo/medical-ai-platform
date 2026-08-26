@@ -77,6 +77,29 @@ def test_bootstrap_rejects_invalid_identifiers_before_persistence(password_servi
     assert repository.plan is None
 
 
+@pytest.mark.parametrize(
+    "email",
+    ["ü@example.com", "josé@example.com", "K@example.com", "ſ@example.com", "ß@example.com"],
+)
+def test_bootstrap_rejects_non_ascii_email_before_persistence(
+    password_service,
+    email: str,
+) -> None:
+    repository = FakeBootstrapRepository()
+    service = IdentityAdministrationService(repository, password_service=password_service)
+
+    with pytest.raises(ValueError, match="email"):
+        service.bootstrap_first_administrator(
+            email=email,
+            display_name="Admin",
+            password="correct horse battery staple",
+            organization_name="Hospital A",
+            organization_slug="hospital-a",
+        )
+
+    assert repository.plan is None
+
+
 def test_bootstrap_enforces_password_policy(password_service) -> None:
     service = IdentityAdministrationService(
         FakeBootstrapRepository(),

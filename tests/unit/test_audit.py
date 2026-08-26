@@ -50,6 +50,8 @@ def _draft(**overrides: object) -> AuditEventDraft:
             "job_type": "interactive_query",
             "role_keys": ["analyst", "organization_admin"],
             "facility_count": 3,
+            "created_count": 1,
+            "existing_count": 2,
         },
     }
     values.update(overrides)
@@ -75,6 +77,8 @@ def test_audit_service_normalizes_only_bounded_aggregate_metadata() -> None:
         "job_type": "interactive_query",
         "role_keys": ("analyst", "organization_admin"),
         "facility_count": 3,
+        "created_count": 1,
+        "existing_count": 2,
     }
     assert isinstance(event.details, Mapping)
     with pytest.raises(TypeError):

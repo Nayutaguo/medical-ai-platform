@@ -6,6 +6,7 @@ import re
 from uuid import uuid4
 
 from medical_ai.authorization import PermissionCode
+from medical_ai.identity.emails import normalize_ascii_email
 from medical_ai.identity.models import (
     BootstrapPlan,
     BootstrapResult,
@@ -105,9 +106,8 @@ class IdentityAdministrationService:
 
 
 def _validated_email(value: str) -> str:
-    normalized = value.strip().casefold() if isinstance(value, str) else ""
-    local, separator, domain = normalized.partition("@")
-    if not separator or not local or "." not in domain or len(normalized) > 320:
+    normalized = normalize_ascii_email(value)
+    if normalized is None:
         raise ValueError("email 格式不正确")
     return normalized
 
