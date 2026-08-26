@@ -1,14 +1,15 @@
 # Project status
 
-Last updated: 2026-08-24.
+Last updated: 2026-08-25.
 
 ## Delivery position
 
 The repository is in Phase 2.5 product governance and early Phase 3 Agent
 workflow. The aggregate analysis loop works, and the first authenticated,
 tenant-aware privacy boundary is implemented. It is still **not a production
-release**: full data, administration workflows, durable audit integration,
-background jobs, operations, and release testing remain open.
+release**: the local full dataset and first organization-administration slice
+are implemented, but administration integration acceptance, durable audit/job
+integration, production data operations, and release testing remain open.
 
 Estimated position against the documented end state:
 
@@ -61,6 +62,11 @@ entry point.
   single Agent permission cannot bypass downstream tool authorization.
 - Session idle extension is monotonic under out-of-order concurrent requests.
 - A one-time interactive administrator bootstrap exists with no default password.
+- The tenant-bound administration API and first management workspace cover
+  member/role/facility catalogs, one-time invitations, role and facility-scope
+  replacement, membership suspension/reactivation, and facility synchronization.
+  Every write requires CSRF and exact permissions; membership writes also use
+  optimistic `expected_version` checks.
 
 ### Tenant and database integrity
 
@@ -73,8 +79,19 @@ entry point.
   actors cannot carry user identity.
 - Audit identity references use retention-safe semantics rather than cascade
   deletion.
+- Successful invitation, membership-role, facility-scope, membership-status,
+  and facility-catalog mutations append sanitized audit facts in the same MySQL
+  transaction as the control-plane write. Attempt/failure and outbox coverage
+  remain incomplete.
+- Facility-catalog synchronization requires an explicit
+  `INPATIENT_DATASET_OWNER_ORGANIZATION_ID` match and cannot bind the global
+  inpatient catalog to an arbitrary first caller.
 - The `inpatient` table has the mandatory facility/year index used by trusted
   scope queries.
+- The local SPARCS 2021 dataset has completed streaming clean, zero-reject
+  manifest/hash reconciliation, staging validation, atomic MySQL publish, and
+  rollback-table retention for all 2,101,588 rows. Import publication and
+  recovery semantics are recorded in ADR 0004.
 - Migration 005 reconciles SQLAlchemy/MySQL comments explicitly and has reviewed
   upgrade, downgrade, partial-recovery, and cross-tenant tests.
 
@@ -118,38 +135,50 @@ entry point.
 - The frontend clears stale results before new queries, detects empty/non-JSON
   HTTP responses, displays request IDs, shows the medical disclaimer, disposes
   charts, and throttles resize through `requestAnimationFrame`.
+- The frontend management view is permission-aware, keeps raw invitation tokens
+  out of browser storage, chains optimistic versions across role/scope writes,
+  treats an empty facility scope as deny-all, and prevents self-status changes
+  in the normal UI. Backend authorization remains the enforcement boundary.
 
 ## Verified state
 
-- Python unit suite: **291 passed**.
-- Normal full suite: **291 passed, 6 external integrations skipped**.
-- Real local MySQL integration suite: **6 passed** with `RUN_MYSQL_TESTS=1`.
+- Python/unit-backed suite: **428 passed**.
+- Normal full suite: **428 passed, 9 external integrations skipped**.
+- Real local MySQL integration suite: **9 passed** with `RUN_MYSQL_TESTS=1`.
 - Alembic: `006_invitation_registration (head)` and
   `No new upgrade operations detected`.
-- Frontend: TypeScript check and production Vite build pass. The only build note
-  is the existing bundle-size warning.
+- Frontend: **12 Vitest/Testing Library checks passed**; the TypeScript check and
+  production Vite build pass. The only build note is the existing bundle-size
+  warning.
 - Python compileall and `git diff --check` pass.
 - `redis` 6.4.0 is installed in the current Conda environment.
 
-The local analytics database still contains only the 1,000-row cleaned SPARCS
-development subset. The source file contains about 2.1 million data rows and has
-not completed full-load acceptance.
+The local analytics database contains all 2,101,588 accepted SPARCS 2021 rows.
+The prior 1,000-row table remains available as
+`inpatient_backup_876dcce267b14044bfe85e5270b6207f`; it has not been approved
+for deletion. The full clean produced zero rejected rows and no non-newborn
+record with a non-null birth weight. There are 10,642 rows without a facility
+ID; governed facility-scoped queries exclude them until an approved mapping
+policy exists.
 
 ## Release blockers
 
 ### P0: required before a product release
 
-1. Run the full 2.1M-row streaming clean/import through staging, checkpointing,
-   rejection reporting, source hash, row/quality reconciliation, atomic publish,
-   and query-plan benchmarks. The current loader is not yet a recoverable import
-   product.
-2. Implement user/membership lifecycle, role assignment, and facility-scope
-   administration services/APIs, then add a small permission-aware administration
-   UI. Login and invited registration alone cannot provision an analyst.
+1. Productize the verified 2.1M-row import path as durable background work:
+   connect `background_jobs` and `dataset_versions`, add checkpoint/resume,
+   idempotent activation, rejected-row artifacts, cancellation, interrupted-DDL
+   reconciliation, backup/restore drills, and production-like load acceptance.
+   The local controlled CLI acceptance is complete, but it is not yet an
+   operator-facing import product.
+2. Complete administration release acceptance. The first backend/API/UI slice
+   now provisions invited members with roles and explicit facility scopes, but
+   real-MySQL mutation tests, cross-tenant/outage tests, authenticated browser
+   E2E, role-definition administration, and operational runbooks remain.
 3. Connect audit attempt/success/failure events to login, logout, denied access,
-   query, Agent, import, and administration paths. Security writes must use a
-   transaction-aware writer or outbox; the current audit primitive is not yet a
-   complete audit trail.
+   query, Agent, import, and remaining administration paths. Successful
+   administration mutations now write transactionally, but failures and
+   cross-service operations still require a transaction-aware writer or outbox.
 4. Add privileged-account MFA/step-up. Invitation activation now uses tenant,
    membership, purpose, identity-version, expiry, and atomic single-use binding;
    password reset remains disabled until it satisfies the same standard.
@@ -187,20 +216,24 @@ not completed full-load acceptance.
 
 ## Working tree and handoff
 
-The active branch is `feat/platform-development`. The repository still has only
-the initial commit; the productization work is present as a large uncommitted and
-untracked working tree. This is a delivery risk. Before synchronization, split
-the changes into small Conventional Commits (migrations, identity/auth, governed
-query, rate limit, frontend, docs) and add CI. Do not commit `.env`, local data,
-database exports, logs, `frontend/dist`, or generated caches.
+The active branch is `feat/full-data-pipeline`, based on the latest
+`origin/main`. The full-data pipeline changes are not yet committed. Before
+synchronization, keep them as focused Conventional Commits for cleaning rules,
+safe import state, tests, and documentation. Do not commit `.env`, raw/cleaned
+data, profiles, manifests, load audits, database exports, retained MySQL backup
+contents, logs, `frontend/dist`, or generated caches.
 
 ## Next implementation order
 
-1. Administration write services/APIs plus transactional audit/outbox.
-2. Full-data recoverable import and quality acceptance.
+1. Administration real-MySQL/browser acceptance, role-definition operations,
+   and complete attempt/failure audit/outbox integration.
+2. Connect the accepted full-data pipeline to durable job/dataset-version state,
+   checkpoint/recovery, and facility mapping governance.
 3. Redis query/Agent limits and durable Celery jobs.
-4. Minimal administration UI and authenticated E2E tests.
+4. Administration and analytics authenticated E2E tests plus operations UI
+   hardening.
 5. Production credentials, deployment, monitoring, backup, and load acceptance.
 
 The accepted design is documented in ADR 0001 (identity/governance), ADR 0002
-(Redis/jobs/locking), and ADR 0003 (governed analytics/privacy).
+(Redis/jobs/locking), ADR 0003 (governed analytics/privacy), and ADR 0004
+(recoverable full-data publish).

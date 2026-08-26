@@ -1,6 +1,9 @@
 # Environment
 
-Checked on 2026-08-18 in WSL.
+The table below records the original 2026-08-18 WSL baseline. The active
+2026-08-25 acceptance was run on macOS with the same Conda/MySQL configuration
+contract; current product and data facts are listed after the table and in
+`docs/PROJECT_STATUS.md`.
 
 ## System
 
@@ -51,15 +54,18 @@ Created now:
 - Python 3.11.15 in `medical-ai`
 - Local MySQL database `medical_ai`
 - Local MySQL user `medical_ai`
-- `inpatient` table loaded with 1000 cleaned SPARCS 2021 development rows
-- React/Vite/MUI/ECharts frontend demo in `frontend/`
+- `inpatient` live table loaded with 2,101,588 accepted SPARCS 2021 rows
+- Prior 1,000-row table retained as the task-specific rollback table documented
+  in `docs/DATA_CLEANING.md`
+- React/Vite/MUI/ECharts authenticated workbench in `frontend/`
 
 Deferred:
 
 - Hadoop
 - Spark cluster
-- Redis
-- production frontend build
+- Redis service deployment/HA (the Python client and fail-closed login limiter
+  are implemented)
+- production frontend hosting (the production build itself passes)
 - model weights
 - pandas for EDA/profiling; current cleaning scripts use streaming stdlib CSV for low memory use
 
@@ -81,8 +87,9 @@ After local MySQL installation and setup, these commands were verified:
 ```bash
 mysql -h 127.0.0.1 -P 3306 -u "$MYSQL_USER" -p"$MYSQL_PASSWORD" "$MYSQL_DATABASE" -e "SELECT 1;"
 conda run -n medical-ai python scripts/load_sample_mysql.py --replace
-conda run -n medical-ai python scripts/clean_sparcs_csv.py --limit 1000 --output data/processed/inpatient_sparcs_2021_clean_1000.csv
-conda run -n medical-ai python scripts/load_sparcs_mysql.py --csv data/processed/inpatient_sparcs_2021_clean_1000.csv --replace-table
+conda run -n medical-ai python scripts/clean_sparcs_csv.py --output data/processed/inpatient_sparcs_2021_clean.csv
+conda run -n medical-ai python scripts/load_sparcs_mysql.py --csv data/processed/inpatient_sparcs_2021_clean.csv --source-manifest data/processed/inpatient_sparcs_2021_clean.manifest.json --dry-run
+conda run -n medical-ai python scripts/load_sparcs_mysql.py --csv data/processed/inpatient_sparcs_2021_clean.csv --source-manifest data/processed/inpatient_sparcs_2021_clean.manifest.json --method load-data
 RUN_MYSQL_TESTS=1 conda run -n medical-ai pytest tests/integration
 conda run -n medical-ai python scripts/demo_query_mysql.py data/sample/queryspec_avg_charges_by_age.json
 conda run -n medical-ai python scripts/demo_llm_query.py "2021年50到69岁和70岁以上患者的平均总费用是多少，按年龄组排序" --execute
@@ -100,10 +107,14 @@ LLM credential note: DeepSeek/OpenAI-compatible settings are also local-only. `L
 
 Network note: LLM demos require outbound HTTPS access. The managed sandbox blocks normal socket creation, so Codex needs escalated execution for those demos. One run hit a transient TLS EOF; the minimal LLM client now retries network-level failures up to two times.
 
-MySQL bulk-load note: `LOAD DATA LOCAL INFILE` is currently disabled on the MySQL server. Enabling it requires sudo:
+MySQL bulk-load note: `LOAD DATA LOCAL INFILE` was enabled for the 2026-08-25
+local full-data acceptance. Changing this server setting is an explicit database
+administration action:
 
 ```bash
 sudo mysql -e "SET GLOBAL local_infile = 1; SHOW GLOBAL VARIABLES LIKE 'local_infile';"
 ```
 
-Until that is enabled, `scripts/load_sparcs_mysql.py --method insert` works and has been verified for the 1000-row demo subset.
+If it is unavailable in another environment, `--method auto` falls back to the
+bounded insert path, or `--method insert` can require that path. Both still
+require the successful complete cleaning manifest.

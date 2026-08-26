@@ -14,6 +14,9 @@ Goal: run a safe, testable data-query chain.
   - `query_medical_data`
 - Provide synthetic development data and sample queries.
 - Provide scripts for cleaning and loading a SPARCS development subset.
+- Completed local full-data acceptance: 2,101,588 SPARCS 2021 rows were
+  stream-cleaned with zero rejects, manifest/hash reconciliation, staging load,
+  atomic MySQL publish, and a retained rollback table. See ADR 0004.
 - Keep database integration tests optional.
 
 ## Phase 1.5 - Minimal LLM Planner
@@ -62,6 +65,11 @@ Goal: turn the analytical workbench into an authenticated, tenant-aware, auditab
   visibility is not an authorization boundary.
 - Completed for authenticated HTTP: RBAC plus organization/facility data scopes
   and a trusted predicate outside QuerySpec/model input.
+- Completed first administration slice: tenant-bound member, role, and facility
+  catalogs; one-time invitation issuance; optimistic role/scope replacement;
+  membership lifecycle updates; and facility-catalog synchronization. Writes
+  require CSRF and exact `users.manage`, `roles.assign`, or `imports.create`
+  permissions by operation.
 - Require explicit, time-bounded, and fully audited emergency access instead of granting medical-data access implicitly to platform administrators.
 
 ### Privacy, audit, and transport parity
@@ -71,20 +79,29 @@ Goal: turn the analytical workbench into an authenticated, tenant-aware, auditab
 - Completed first field-policy slice: governed distinct/dimension/aggregation/
   filter capabilities across all 34 inpatient fields.
 - Persist sanitized append-only audit events for authentication, administration, queries, Agent calls, imports, exports, and job lifecycle changes.
-- Completed storage primitive only: audit request-path and transaction/outbox
-  integration remains.
+- Completed for successful administration mutations: the audit fact shares the
+  control-plane transaction. Attempt/failure coverage, other request paths, and
+  transaction/outbox integration remain.
 - Completed: authenticated product analytics routes and non-sensitive health.
 - Completed fail-closed product posture: unscoped MCP is disabled. An
   authenticated MCP principal adapter remains.
 
 ### Product UI and operations
 
-- Completed first UI slice: existing workbench plus login, invitation-only
+- Completed first UI slices: existing workbench; login, invitation-only
   registration, permission-pending state, session restore, current organization,
-  and logout. Administration pages remain.
+  and logout; plus a permission-aware organization management workspace for
+  invitations, member status, roles, facility scopes, and catalog sync.
+- Administration still needs real-MySQL mutation coverage, authenticated browser
+  E2E, role-definition operations, complete audit/outbox behavior, and an
+  operational runbook before release.
 - Completed first Redis slice: production login throttling. Query/Agent limits,
   session/authorization caches, and invalidation remain.
 - Move long-running Agent, import, quality, export, and report work to durable background jobs; expose bounded status polling and cancellation APIs.
+- Connect the verified full-data importer to `background_jobs` and
+  `dataset_versions`, including heartbeat, resume/checkpoint, idempotent
+  activation, cancellation, and recovery drills. The local CLI is complete for
+  a controlled single-host acceptance run but is not the final job product.
 - Use transactions, unique constraints, idempotency keys, and optimistic locking for business correctness; reserve distributed locks for singleton imports, schedulers, and duplicate job submission.
 
 ### Release acceptance
