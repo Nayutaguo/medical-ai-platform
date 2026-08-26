@@ -66,6 +66,44 @@ def test_clean_sparcs_row_treats_unknown_integer_as_null() -> None:
     assert cleaned["APRDRGCode"] is None
 
 
+def test_clean_sparcs_row_clears_birth_weight_for_non_newborn_admission() -> None:
+    cleaned = clean_sparcs_row(
+        {
+            "Type of Admission": "Emergency",
+            "Birth Weight": "not-an-integer",
+        }
+    )
+
+    assert cleaned["AdmissionType"] == "Emergency"
+    assert cleaned["BirthWeight"] is None
+
+
+def test_clean_sparcs_row_keeps_valid_birth_weight_only_for_newborns() -> None:
+    newborn = {
+        "Type of Admission": "Newborn",
+        "Birth Weight": "3000",
+    }
+
+    assert clean_sparcs_row(newborn)["BirthWeight"] == 3000
+
+    newborn["Birth Weight"] = "UNKN"
+    assert clean_sparcs_row(newborn)["BirthWeight"] is None
+
+
+def test_data_quality_profile_bounds_invalid_samples_without_losing_total() -> None:
+    profile = DataQualityProfile(invalid_sample_limit=2)
+
+    for index in range(5):
+        profile.record_invalid_row(index + 2, ValueError(f"private-value-{index}"))
+
+    data = profile.to_dict()
+
+    assert data["invalid_row_count"] == 5
+    assert len(data["invalid_rows_sample"]) == 2
+    assert data["invalid_rows_sample"][0] == {"row_number": 2, "error_code": "VALUE_ERROR"}
+    assert "private-value" not in str(data)
+
+
 def test_data_quality_profile_tracks_counts_ranges_and_lengths() -> None:
     cleaned = {
         "HospitalServiceArea": "New York City",
