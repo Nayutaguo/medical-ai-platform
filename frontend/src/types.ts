@@ -53,12 +53,37 @@ export interface LogoutPayload {
   revoked: boolean;
 }
 
+export interface PasswordChangePayload {
+  changed: true;
+}
+
+export interface PasswordResetRequestPayload {
+  accepted: true;
+  reset_token?: string;
+  expires_at?: string;
+  organization_id?: string;
+}
+
+export interface PasswordResetPayload {
+  reset: true;
+}
+
+export interface AdminPermission {
+  id: string;
+  permission_key: string;
+  resource: string;
+  action: string;
+  description: string | null;
+  version: number;
+}
+
 export interface AdminRole {
   id: string;
   role_key: string;
   name: string;
   description: string | null;
   permissions: string[];
+  is_system?: boolean;
   version: number;
 }
 
@@ -97,6 +122,36 @@ export interface IssuedInvitation {
 export interface FacilitySyncPayload {
   created_count: number;
   existing_count: number;
+}
+
+export interface AuditEvent {
+  id: number;
+  occurred_at: string;
+  request_id: string | null;
+  actor_kind: 'user' | 'system';
+  actor_user_id: string | null;
+  action: string;
+  resource_type: string;
+  resource_id: string | null;
+  outcome: 'success' | 'denied' | 'failure';
+  error_code: string | null;
+  details: Record<string, string | number | boolean | string[] | null>;
+}
+
+export interface AnalysisHistoryItem {
+  id: string;
+  kind: 'agent' | 'query';
+  title: string;
+  question: string | null;
+  query_spec: Record<string, unknown> | null;
+  chart_spec: ChartSpec | null;
+  row_count: number;
+  truncated: boolean;
+  query_time_ms: number;
+  is_favorite: boolean;
+  created_at: string;
+  updated_at: string;
+  version: number;
 }
 
 export interface SchemaColumn {

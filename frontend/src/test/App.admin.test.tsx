@@ -9,6 +9,7 @@ import {
   issueAdminInvitation,
   listAdminFacilities,
   listAdminMembers,
+  listAdminPermissions,
   listAdminRoles,
   replaceAdminMemberFacilityScope,
   replaceAdminMemberRoles,
@@ -24,6 +25,7 @@ vi.mock('../api', async (importOriginal) => {
     getHealth: vi.fn(),
     getSchema: vi.fn(),
     listAdminMembers: vi.fn(),
+    listAdminPermissions: vi.fn(),
     listAdminRoles: vi.fn(),
     listAdminFacilities: vi.fn(),
     issueAdminInvitation: vi.fn(),
@@ -38,8 +40,8 @@ const session: AuthSession = {
   user: { id: 'user-admin', email: 'admin@example.com', display_name: 'Admin User' },
   organization: { id: 'org-1', name: 'Hospital A', membership_id: 'member-admin' },
   permissions: ['users.manage', 'roles.assign', 'imports.create', 'audit.read'],
-  expires_at: '2026-08-26T00:00:00Z',
-  idle_expires_at: '2026-08-25T23:00:00Z',
+  expires_at: '2099-08-26T00:00:00Z',
+  idle_expires_at: '2099-08-25T23:00:00Z',
 };
 
 const analystRole: AdminRole = {
@@ -89,6 +91,7 @@ const analystMember: AdminMember = {
 function configureBaseMocks() {
   vi.mocked(getCurrentSession).mockResolvedValue(session);
   vi.mocked(listAdminMembers).mockResolvedValue({ items: [analystMember], next_cursor: null });
+  vi.mocked(listAdminPermissions).mockResolvedValue({ items: [], next_cursor: null });
   vi.mocked(listAdminRoles).mockResolvedValue({ items: [analystRole], next_cursor: null });
   vi.mocked(listAdminFacilities).mockResolvedValue({ items: [facility], next_cursor: null });
 }
@@ -148,12 +151,14 @@ describe('administration workspace', () => {
     vi.mocked(issueAdminInvitation).mockResolvedValue({
       membership_id: 'member-new',
       token: 'one-time-secret-token',
-      expires_at: '2026-08-26T00:00:00Z',
+      expires_at: '2099-08-26T00:00:00Z',
     });
 
     render(<App />);
     expect(await screen.findByText('邀请成员')).toBeInTheDocument();
+    await waitFor(() => expect(listAdminPermissions).toHaveBeenCalledTimes(1));
     await user.type(screen.getByRole('textbox', { name: '邮箱' }), 'new@example.com');
+    expect(listAdminPermissions).toHaveBeenCalledTimes(1);
     await user.click(screen.getByRole('button', { name: '创建邀请' }));
 
     expect(await screen.findByText('one-time-secret-token')).toBeInTheDocument();
